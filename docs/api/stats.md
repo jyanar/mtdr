@@ -1,0 +1,3 @@
+# Sufficient statistics
+
+::: mtdr.stats

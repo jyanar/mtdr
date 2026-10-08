@@ -1,0 +1,182 @@
+name: CI
+
+# A push to main or a pull request runs lint, the tests on three OSes x three Pythons,
+# the lowest declared dependencies, the wheel and the docs build. The paper-scale
+# parity tests and the benchmark take longer or depend on the runner's speed; they
+# run when dispatched by hand, `gh workflow run CI --ref <branch>`, before a release.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  lint:
+    name: Lint and type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[lint,test]"
+      - name: pre-commit (ruff, formatting, file hygiene)
+        # mypy's hook is skipped here; the next step runs it against the install.
+        run: SKIP=mypy pre-commit run --all-files --show-diff-on-failure
+      - name: mypy --strict
+        run: mypy
+      - name: Validate CITATION.cff
+        run: pipx run cffconvert --validate
+
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      HYPOTHESIS_PROFILE: ci
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[test]"
+      - name: Install scikit-learn (one leg)
+        # MTDR supports sklearn.base.clone; tests/test_model.py's
+        # test_clone_contract exercises it only where scikit-learn is installed,
+        # so one leg installs it. Not a test-extra dependency.
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'
+        run: python -m pip install scikit-learn
+      - name: pytest
+        run: python -m pytest --cov=mtdr --cov-report=term-missing
+
+  parity-slow:
+    name: Paper-scale MATLAB parity (slow tests)
+    if: github.event_name == 'workflow_dispatch'  # dispatched runs only
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[test]"
+      - name: pytest -m slow
+        # Deselected by default; every other job runs `not slow`. `-s -rA` prints
+        # every measured parity margin and each test's outcome in the log. One
+        # platform is enough: the default jobs run the paper-scale data,
+        # fixed-point and posterior checks on all nine legs; this job compares the
+        # fits, whose margins it prints.
+        run: python -m pytest -m slow -p no:cacheprovider -s -rA
+
+  benchmark:
+    name: Benchmark (regression threshold)
+    if: github.event_name == 'workflow_dispatch'  # dispatched runs only
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: python -m pip install -e .
+      - name: benchmarks/ci_bench.py
+        # Every workload's raw seconds must stay within 1.5 times the committed
+        # Linux baseline (the per-workload median of four runs of this job,
+        # benchmarks/baseline.json), and the paper-scale fit's work must match it
+        # (outer iterations exact, inner L-BFGS-B iterations within 1.5 times,
+        # converged). The measurement is
+        # printed as JSON, between MEASUREMENT-JSON-BEGIN/END, so a new baseline
+        # can be combined from this job's logs (`ci_bench.py --combine`).
+        run: python benchmarks/ci_bench.py
+
+  min-deps:
+    name: Test (lowest declared dependencies, Python 3.11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HYPOTHESIS_PROFILE: ci
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install the declared floors
+        run: |
+          python -m pip install uv
+          uv pip install --system --resolution lowest-direct -e ".[test]"
+          python -m pip list | grep -iE "^(numpy|scipy|pytest|hypothesis) "
+      - name: pytest
+        run: python -m pytest --cov=mtdr
+
+  build:
+    name: Build, install and test the wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+      - name: Install the wheel into a clean venv
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/python -m pip install dist/*.whl pytest hypothesis "pandas>=2.2.2"
+          cd /tmp
+          /tmp/wheel-venv/bin/python - <<'EOF'
+          import importlib.resources as r
+          import mtdr
+          assert r.files("mtdr").joinpath("py.typed").is_file(), "py.typed missing"
+          assert "site-packages" in mtdr.__file__, mtdr.__file__
+          print("mtdr", mtdr.__version__, "from", mtdr.__file__)
+          EOF
+      - name: Run the test suite against the installed wheel
+        # From outside the checkout, so `mtdr` resolves to site-packages.
+        run: |
+          cp -r tests /tmp/wheel-tests
+          cd /tmp
+          /tmp/wheel-venv/bin/python -m pytest -p no:cacheprovider -m "not slow" wheel-tests
+
+  docs:
+    name: Docs build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[docs]"
+      - name: mkdocs build --strict
+        run: mkdocs build --strict

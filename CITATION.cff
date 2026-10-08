@@ -1,0 +1,61 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite it as below, together with the two
+  papers that introduced mTDR (listed under references).
+type: software
+title: "mtdr: model-based targeted dimensionality reduction in Python"
+abstract: >-
+  A Python port of model-based targeted dimensionality reduction (mTDR), which
+  fits neural population activity as a sum of low-rank, time-varying regression
+  coefficient matrices, one per task variable, with ranks chosen by AIC and
+  support for non-simultaneously recorded neurons.
+authors:
+  - family-names: Yanar
+    given-names: Jorge
+    affiliation: Princeton University
+license: MIT
+repository-code: "https://github.com/jyanar/mtdr"
+version: 0.1.0
+date-released: "2026-10-08"
+keywords:
+  - neuroscience
+  - dimensionality reduction
+  - reduced-rank regression
+  - neural population
+references:
+  - type: article
+    title: >-
+      Prefrontal cortex exhibits multidimensional dynamic encoding during
+      decision-making
+    authors:
+      - family-names: Aoi
+        given-names: Mikio C.
+      - family-names: Mante
+        given-names: Valerio
+      - family-names: Pillow
+        given-names: Jonathan W.
+    journal: Nature Neuroscience
+    volume: 23
+    start: 1410
+    end: 1420
+    year: 2020
+    doi: 10.1038/s41593-020-0696-5
+  - type: conference-paper
+    title: Model-based targeted dimensionality reduction for neuronal population data
+    authors:
+      - family-names: Aoi
+        given-names: Mikio C.
+      - family-names: Pillow
+        given-names: Jonathan W.
+    collection-title: Advances in Neural Information Processing Systems
+    volume: 31
+    year: 2018
+  - type: software
+    title: mTDRdemo
+    authors:
+      - family-names: Aoi
+        given-names: Mikio C.
+      - family-names: Pillow
+        given-names: Jonathan W.
+    repository-code: "https://github.com/pillowlab/mTDRdemo"
+    notes: The MATLAB implementation this package ports.

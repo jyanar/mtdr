@@ -1,0 +1,57 @@
+# Install once with `pre-commit install`; CI runs `pre-commit run --all-files`.
+# mypy runs here in an isolated env for fast local feedback; CI skips this hook
+# (SKIP=mypy) and runs mypy against the installed package instead.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # --enforce-all checks every tracked file, not only new additions, so
+      # `pre-commit run --all-files` in CI enforces the limits. MATLAB parity
+      # fixtures may reach 2500 KB; everything else stays under 1000 KB.
+      - id: check-added-large-files
+        args: [--maxkb=1000, --enforce-all]
+        exclude: ^tests/fixtures/.*\.mat$
+      - id: check-added-large-files
+        name: check for large MATLAB fixtures
+        args: [--maxkb=2500, --enforce-all]
+        files: ^tests/fixtures/.*\.mat$
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      # Design notes are kept outside the repository; their identifiers stay out.
+      - id: internal-refs
+        name: no references to notes outside the repository
+        entry: python tools/check_internal_refs.py
+        language: python
+        types: [text]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.9
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.3.1
+    hooks:
+      - id: mypy
+        # Check the whole project ([tool.mypy] files), not only staged files:
+        # with just a test staged, `import mtdr` would silently become Any.
+        pass_filenames: false
+        args: []
+        additional_dependencies:
+          - numpy>=2.0
+          - scipy-stubs
+          - pytest>=8.1
+          - hypothesis>=6.100
+          - matplotlib>=3.9
+          - xarray>=2024.6

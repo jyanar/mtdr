@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Codex exec final-message captures
+*.last.md
+
+# Environments and tool output
+.venv/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+site/

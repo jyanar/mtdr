@@ -1,0 +1,85 @@
+site_name: mtdr
+site_url: https://jyanar.github.io/mtdr/
+site_description: Model-based targeted dimensionality reduction for neural population data
+repo_url: https://github.com/jyanar/mtdr
+repo_name: jyanar/mtdr
+edit_uri: edit/main/docs/
+strict: true
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.sections
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - The model and its estimation: model.md
+  - Differences from MATLAB: differences-from-matlab.md
+  - API reference:
+      - The MTDR estimator: api/model.md
+      - Data utilities: api/data.md
+      - Plotting: api/plot.md
+      - xarray output: api/xarray_io.md
+      - Simulation: api/simulation.md
+      - Sufficient statistics: api/stats.md
+      - SVD estimator: api/svd_fit.md
+      - Marginal-likelihood estimator: api/mmle.md
+      - Parameter counts and AIC: api/aic.md
+      - Rank search: api/rank_search.md
+      - Errors and warnings: api/errors.md
+  - Changelog: changelog.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          inventories:
+            - https://docs.python.org/3/objects.inv
+            - https://numpy.org/doc/stable/objects.inv
+            - https://docs.scipy.org/doc/scipy/objects.inv
+          options:
+            docstring_style: numpy
+            show_root_heading: true
+            show_source: false
+            members_order: source
+            show_bases: true
+            # Hide private and dunder members (__post_init__, __repr__,
+            # __setstate__); the public constants carry attribute docstrings.
+            filters: ["!^_"]
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.snippets:
+      check_paths: true
+  - pymdownx.arithmatex:
+      generic: true
+  - toc:
+      permalink: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn

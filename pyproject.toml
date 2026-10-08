@@ -1,0 +1,187 @@
+[build-system]
+requires = ["hatchling>=1.27"]  # 1.27: PEP 639 license-files array
+build-backend = "hatchling.build"
+
+[project]
+name = "mtdr"
+dynamic = ["version"]
+description = "Model-based targeted dimensionality reduction (mTDR) for neural population data"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Jorge Yanar", email = "jorgeyanar@gmail.com" }]
+keywords = [
+  "neuroscience",
+  "dimensionality reduction",
+  "reduced-rank regression",
+  "neural population",
+  "mTDR",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Typing :: Typed",
+]
+# numpy 2.0: one set of batched-linalg semantics; scipy 1.13 is the first release
+# built against it. The min-deps CI job tests these floors.
+dependencies = ["numpy>=2.0", "scipy>=1.13"]
+
+[project.optional-dependencies]
+# matplotlib 3.9 and xarray 2024.6: the first releases built for numpy 2.0. The
+# test extra carries the same floors, so CI covers mtdr.plot and MTDR.to_xarray
+# and the min-deps job tests the floors.
+plot = ["matplotlib>=3.9"]
+# pandas 2.2.2: the first release that installs and imports with numpy 2.0 (2.2.1
+# requires numpy<2; 2.0.0 installs but fails at import with "numpy.dtype size
+# changed"). The test extra carries the same floor, so the min-deps job tests it.
+xarray = ["xarray>=2024.6", "pandas>=2.2.2"]
+test = [
+  "pytest>=8.1",  # 8.0 + importlib mode double-imports doctest modules
+  "pytest-cov>=5.0",
+  "hypothesis>=6.100",
+  "pandas>=2.2.2",  # RankSearchHistory.to_frame, so CI and the floor cover it
+  "matplotlib>=3.9",  # mtdr.plot and its doctests
+  "xarray>=2024.6",  # MTDR.to_xarray
+]
+lint = [
+  # Pinned to the pre-commit revs; bump both together.
+  "ruff==0.16.9",
+  "mypy==2.3.1",
+  "scipy-stubs",
+  "pre-commit>=3.7",
+]
+docs = [
+  "mkdocs>=1.6,<2",  # MkDocs 2.0 removes the plugin system mkdocstrings needs
+  "mkdocs-material>=9.5",
+  "mkdocstrings[python]>=0.26",
+]
+dev = ["mtdr[test,lint,docs]"]
+
+[project.urls]
+Homepage = "https://github.com/jyanar/mtdr"
+Documentation = "https://jyanar.github.io/mtdr/"
+Source = "https://github.com/jyanar/mtdr"
+Issues = "https://github.com/jyanar/mtdr/issues"
+Changelog = "https://github.com/jyanar/mtdr/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/mtdr/_version.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/CHANGELOG.md",
+  "/CITATION.cff",
+  "/LICENSE",
+  "/README.md",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mtdr"]
+
+# --------------------------------------------------------------------------- ruff
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests", "benchmarks", "tools"]
+# The getting-started page holds the worked example, which
+# tests/test_worked_example.py runs as written.
+extend-exclude = ["docs/getting-started.md"]
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle errors
+  "W",    # pycodestyle warnings
+  "F",    # pyflakes
+  "I",    # isort
+  "B",    # bugbear
+  "UP",   # pyupgrade
+  "N",    # pep8-naming
+  "D",    # pydocstyle (numpy convention below)
+  "NPY",  # numpy-specific rules
+  "PT",   # pytest style
+  "SIM",  # simplify
+  "RUF",  # ruff-specific
+  "C4",   # comprehensions
+  "PIE",
+  "RET",
+]
+ignore = [
+  "N803", # argument names: the package uses math names (Y, X, W, S, B)
+  "N806", # variable names: same
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+"benchmarks/**" = ["E402"]
+"docs/**" = ["D"]
+
+# --------------------------------------------------------------------------- mypy
+
+[tool.mypy]
+# No python_version pin: current numpy stubs use 3.12 syntax. ruff (target py311)
+# enforces 3.11-compatible syntax; the 3.11 CI legs exercise the runtime.
+strict = true
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+files = ["src", "tests", "benchmarks", "tools"]
+
+[[tool.mypy.overrides]]
+# Optional dependency (RankSearchHistory.to_frame), absent from the lint env.
+module = ["pandas", "pandas.*"]
+ignore_missing_imports = true
+
+# --------------------------------------------------------------------------- pytest
+
+[tool.pytest.ini_options]
+minversion = "8.1"
+testpaths = ["tests", "src/mtdr"]
+addopts = [
+  "-ra",
+  "--strict-markers",
+  "--strict-config",
+  "--doctest-modules",
+  "--import-mode=importlib",
+  # Paper-scale parity tests take minutes; run them with `-m slow`.
+  "-m",
+  "not slow",
+]
+markers = [
+  "slow: paper-scale MATLAB parity (minutes); deselected by default, `pytest -m slow` runs them",
+]
+doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
+filterwarnings = ["error"]
+xfail_strict = true
+
+# --------------------------------------------------------------------------- coverage
+
+[tool.coverage.run]
+source = ["mtdr"]
+branch = true
+
+[tool.coverage.paths]
+source = ["src/mtdr", "*/site-packages/mtdr"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 95
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "@overload",
+]
