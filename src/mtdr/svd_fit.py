@@ -28,7 +28,7 @@ baseline costs no accuracy.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -384,16 +384,15 @@ def fit_svd(
     B_full = [np.ascontiguousarray(beta[:, p, :]) for p in range(P)]
     energy = stats.YtY_c if ci else stats.YtY_raw
     blocks = beta.transpose(1, 0, 2)  # (P, n, T)
-    truncate = _truncate if grouping is None else _grouped_truncation(grouping)
     if weighted:
         # (M18w): truncate D B_full,p and map back with D^-1.
         d = _precision_weights(stats, ci, gamma, beta, energy)
-        W, S, _ = truncate(blocks * d[None, :, None], rank_list)
+        W, S, _ = _truncate(blocks * d[None, :, None], rank_list, grouping)
         W = [np.ascontiguousarray(w / d[:, None]) for w in W]
         group_of = range(P) if grouping is None else grouping.group_of
         B = [W[g] @ s.T for g, s in zip(group_of, S, strict=True)]
     else:
-        W, S, B = truncate(blocks, rank_list)
+        W, S, B = _truncate(blocks, rank_list, grouping)
     B_arr = np.stack(B, axis=1)  # (n, P, T)
     count = stats.n_obs.astype(np.float64)
     intercept: FloatArray | None = None
@@ -513,14 +512,18 @@ def _least_squares(G: FloatArray, rhs: FloatArray) -> tuple[FloatArray, IntArray
 
 
 def _truncate(
-    B_full: FloatArray, ranks: Sequence[int]
+    B_full: FloatArray,
+    ranks: Sequence[int],
+    grouping: _groups.Grouping | None = None,
 ) -> tuple[list[FloatArray], list[FloatArray], list[FloatArray]]:
     """Rank-`r_p` truncated SVD factors of each `(n, T)` block, (M17)-(M18).
 
     Signs: the entry of largest absolute value of each left singular
     vector is made positive (ties to the first such entry), and the right
-    singular vector flipped with it.
+    singular vector flipped with it. With `grouping`, `_truncate_groups`.
     """
+    if grouping is not None:
+        return _truncate_groups(B_full, ranks, grouping)
     U, s, Vt = np.linalg.svd(B_full, full_matrices=False)
     lead = np.take_along_axis(U, np.argmax(np.abs(U), axis=1)[:, None, :], axis=1)[
         :, 0, :
@@ -541,39 +544,24 @@ def _truncate(
     return W, S, B
 
 
-def _grouped_truncation(
-    grouping: _groups.Grouping,
-) -> Callable[
-    [FloatArray, Sequence[int]],
-    tuple[list[FloatArray], list[FloatArray], list[FloatArray]],
-]:
-    """Return the truncation of (M58) for `grouping`, with `_truncate`'s outputs."""
+def _truncate_groups(
+    B_full: FloatArray, ranks: Sequence[int], grouping: _groups.Grouping
+) -> tuple[list[FloatArray], list[FloatArray], list[FloatArray]]:
+    r"""`_truncate` of each group's blocks side by side, $[\hat B_p]_{p\in g}$, (M58).
 
-    def truncate(
-        B_full: FloatArray, ranks: Sequence[int]
-    ) -> tuple[list[FloatArray], list[FloatArray], list[FloatArray]]:
-        r"""Truncate each group's concatenated blocks $[\hat B_p]_{p\in g}$, (M58).
-
-        `W` per group, `S` and `B` per column; the sign rule of `_truncate`.
-        """
-        T = B_full.shape[2]
-        W: list[FloatArray] = []
-        S: list[FloatArray | None] = [None] * B_full.shape[0]
-        for members, r in zip(grouping.groups, ranks, strict=True):
-            joined = np.concatenate([B_full[p] for p in members], axis=1)
-            U, s, Vt = np.linalg.svd(joined, full_matrices=False)
-            lead = U[np.argmax(np.abs(U), axis=0), np.arange(U.shape[1])]
-            sign = np.where(lead < 0, -1.0, 1.0)
-            root = np.sqrt(s[:r])
-            W.append(np.ascontiguousarray(U[:, :r] * (sign[:r] * root)))
-            V = Vt[:r].T * (sign[:r] * root)  # (|g| T, r)
-            for j, p in enumerate(members):
-                S[p] = np.ascontiguousarray(V[j * T : (j + 1) * T])
-        S_out = [s for s in S if s is not None]
-        B = [W[g] @ S_out[p].T for p, g in enumerate(grouping.group_of)]
-        return W, S_out, B
-
-    return truncate
+    `W` per group, `S` and `B` per column; the same sign rule.
+    """
+    T = B_full.shape[2]
+    W: list[FloatArray] = []
+    S: dict[int, FloatArray] = {}
+    for members, r in zip(grouping.groups, ranks, strict=True):
+        joined = np.concatenate([B_full[p] for p in members], axis=1)
+        (Wg,), (V,), _ = _truncate(joined[None], [r])
+        W.append(Wg)
+        for j, p in enumerate(members):
+            S[p] = np.ascontiguousarray(V[j * T : (j + 1) * T])
+    S_out = [S[p] for p in range(len(S))]
+    return W, S_out, [W[g] @ S_out[p].T for p, g in enumerate(grouping.group_of)]
 
 
 def _residual(

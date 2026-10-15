@@ -33,6 +33,7 @@ from mtdr._args import as_real as _as_real
 from mtdr._args import positive_int as _positive_int
 from mtdr._frozen import ReadOnlyMapping as _ReadOnlyMapping
 from mtdr._frozen import restore_frozen
+from mtdr._groups import Grouping
 from mtdr.errors import ParameterError
 
 __all__ = ["SimulatedData", "simulate"]
@@ -428,12 +429,8 @@ def simulate(
         )
     group_names = tuple(resolved)
     position = {name: p for p, name in enumerate(names)}
-    members = [[position[m] for m in resolved[g]] for g in group_names]
-    group_of = [0] * len(names)
-    for g, columns in enumerate(members):
-        for p in columns:
-            group_of[p] = g
-    column_ranks = [rank_list[g] for g in group_of]
+    grouping = Grouping(tuple(tuple(position[c] for c in m) for m in resolved.values()))
+    column_ranks = grouping.column_ranks(rank_list)
     n_regressors = len(names)
     min_trials = max(_MIN_OBSERVATIONS, n_regressors + int(condition_independent))
     if n_trials < min_trials:
@@ -443,16 +440,14 @@ def simulate(
             f"and one trial per {each}, so the design can have full column "
             f"rank); got {n_trials}"
         )
-    for name, r, columns in zip(group_names, rank_list, members, strict=True):
-        max_rank = min(n_neurons, len(columns) * n_bins)
-        if r > max_rank and groups is None:
-            raise ParameterError(
-                f"rank of {name!r} is {r}, above min(n_neurons, n_bins) = {max_rank}"
+    for name, r, size in zip(group_names, rank_list, grouping.sizes, strict=True):
+        cap = min(n_neurons, size * n_bins)
+        if r > cap:
+            what, limit = (
+                ("", "n_bins") if groups is None else ("group ", f"{size} * n_bins")
             )
-        if r > max_rank:
             raise ParameterError(
-                f"rank of group {name!r} is {r}, above min(n_neurons, "
-                f"{len(columns)} * n_bins) = {max_rank}"
+                f"rank of {what}{name!r} is {r}, above min(n_neurons, {limit}) = {cap}"
             )
     X_given: FloatArray | None = None
     if X is None:
@@ -505,7 +500,9 @@ def simulate(
         # skips its draw.
         W_list: list[FloatArray] = []
         S_cols: list[FloatArray | None] = [None] * n_regressors
-        for r, amp, w_g, columns in zip(rank_list, amps, W_given, members, strict=True):
+        for r, amp, w_g, columns in zip(
+            rank_list, amps, W_given, grouping.groups, strict=True
+        ):
             if w_g is None:
                 w_g = amp * rng.standard_normal((n_neurons, r))
             W_list.append(w_g)
@@ -517,7 +514,7 @@ def simulate(
                     s_p = _gp_bases(basis_normals, _gp_factor(kernel))
                 S_cols[p] = s_p
         S_list = [s for s in S_cols if s is not None]
-        B = [W_list[g] @ s.T for g, s in zip(group_of, S_list, strict=True)]
+        B = [W_list[g] @ s.T for g, s in zip(grouping.group_of, S_list, strict=True)]
         intercept: FloatArray | None = None
         if condition_independent:
             weight_normals = rng.standard_normal((n_neurons, n_bins))
@@ -767,40 +764,19 @@ def _grouped_names_and_ranks(
     """Return the columns, the resolved groups and the per-group ranks."""
     from mtdr.data import resolve_groups  # mtdr.data imports nothing of this module
 
-    if regressor_names is None:
+    if regressor_names is None or not isinstance(ranks, Mapping):
         raise ParameterError(
-            "with groups, pass the column names as regressor_names: the groups list "
-            "columns and ranks names the groups"
+            "with groups, pass the column names as regressor_names and ranks as a "
+            f"mapping of group name to rank; got ranks={ranks!r}"
         )
-    entries = _as_list(regressor_names)
-    if entries is None:
-        raise ParameterError(
-            f"regressor_names must be a sequence of str; got {regressor_names!r}"
-        )
-    if not entries:
-        raise ParameterError("regressor_names must name at least one regressor")
-    resolved = resolve_groups(entries, groups)  # type: ignore[arg-type]
-    names = tuple(str(name) for name in entries)
-    if not isinstance(ranks, Mapping):
-        raise ParameterError(
-            "with groups, ranks must be a mapping of group name to rank naming every "
-            f"group {list(resolved)}; got {ranks!r}"
-        )
+    resolved = resolve_groups(regressor_names, groups)  # type: ignore[arg-type]
     if set(ranks) != set(resolved):
         raise ParameterError(
             f"ranks must name exactly the groups {list(resolved)} (a column of its "
             f"own is a group); got {list(ranks)}"
         )
-    rank_list: list[int] = []
-    for group in resolved:
-        r = _as_int(ranks[group])
-        if r is None or r < 0:
-            raise ParameterError(
-                f"rank of group {group!r} must be a non-negative integer; got "
-                f"{ranks[group]!r}"
-            )
-        rank_list.append(r)
-    return names, resolved, rank_list
+    _, rank_list = _names_and_ranks({g: ranks[g] for g in resolved}, None)
+    return tuple(map(str, _as_list(regressor_names) or ())), resolved, rank_list
 
 
 def _level_sets(

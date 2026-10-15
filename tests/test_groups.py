@@ -167,7 +167,7 @@ def test_grouped_likelihood_is_the_dense_gaussian(layout: str, intercept: bool) 
     # built densely from the grouped design.
     pr = Problem(layout, intercept=intercept)
     ll = marginal_log_likelihood(pr.S, pr.lam, pr.b, pr.stats, groups=pr.groups)
-    direct = dense.grouped_nll(pr.Y, pr.X, pr.mask, pr.S, pr.lam, pr.b, pr.groups)
+    direct = dense.nll(pr.Y, pr.X, pr.mask, pr.S, pr.lam, pr.b, pr.groups)
     assert abs(-ll - direct.sum()) <= ORACLE_RTOL * abs(direct.sum())
     terms = mmle._state(
         mmle._blocks(pr.S, _groups.check_grouping(pr.groups, 4)),
@@ -185,9 +185,7 @@ def test_grouped_likelihood_is_the_dense_gaussian(layout: str, intercept: bool) 
 def test_grouped_posterior_is_the_dense_posterior(layout: str) -> None:
     pr = Problem(layout, seed=1)
     W, cov = posterior_weights(pr.S, pr.lam, pr.b, pr.stats, groups=pr.groups)
-    means, covs = dense.grouped_posterior(
-        pr.Y, pr.X, pr.mask, pr.S, pr.lam, pr.b, pr.groups
-    )
+    means, covs = dense.posterior(pr.Y, pr.X, pr.mask, pr.S, pr.lam, pr.b, pr.groups)
     assert [w.shape[1] for w in W] == pr.ranks
     joined = np.concatenate(W, axis=1)
     assert _rel(joined, means) <= ORACLE_RTOL or not means.size
@@ -199,7 +197,7 @@ def test_grouped_intercept_is_the_gls_mean(layout: str) -> None:
     # (M57): the centred form, tied and pushed forward, against the dense GLS.
     pr = Problem(layout, seed=2)
     b = update_intercept(pr.S, pr.lam, pr.stats, groups=pr.groups)
-    want = dense.grouped_gls_intercept(pr.Y, pr.X, pr.mask, pr.S, pr.lam, pr.groups)
+    want = dense.gls_intercept(pr.Y, pr.X, pr.mask, pr.S, pr.lam, pr.groups)
     assert _rel(b, want) <= ORACLE_RTOL
 
 
@@ -212,24 +210,8 @@ def test_grouped_expected_residual_is_dense(layout: str) -> None:
         blocks, pr.lam, xi, ups, pr.stats.XtX, pr.stats.n_obs, pr.stats.n_bins
     )
     E = mmle._expected_residual(st_.K, st_.u, st_.mu, st_.Cinv, ups)
-    want = dense.grouped_expected_residual(
-        pr.Y, pr.X, pr.mask, pr.S, pr.lam, pr.b, pr.groups
-    )
+    want = dense.expected_residual(pr.Y, pr.X, pr.mask, pr.S, pr.lam, pr.b, pr.groups)
     assert _rel(E, want) <= ORACLE_RTOL
-
-
-def test_the_oracle_reduces_to_the_ungrouped_design() -> None:
-    # The oracle itself: singleton groups give the ungrouped design (M8).
-    pr = Problem("one group of four", seed=4)
-    S = [np.ones((3, 1)), np.ones((3, 2)), np.ones((3, 1)), np.zeros((3, 0))]
-    singles = [[0], [1], [2], [3]]
-    np.testing.assert_array_equal(
-        dense.grouped_design(pr.X, S, singles), dense.design(pr.X, S)
-    )
-    assert dense.grouped_design(pr.X, [np.zeros((3, 0))] * 4, singles).shape == (
-        120,
-        0,
-    )
 
 
 # ------------------------------------------------------------------ gradients
@@ -540,6 +522,46 @@ def test_group_span_maps_scale_the_joint_in_span_directions_only() -> None:
     assert up(np.zeros(0)).shape == (0,)
 
 
+@pytest.mark.parametrize(
+    ("kind", "equivariant"),
+    [("orthogonal", True), ("permutation", True), ("not orthogonal", False)],
+)
+def test_group_span_maps_are_equivariant_under_orthogonal_recodings(
+    kind: str, equivariant: bool
+) -> None:
+    # Recoding a group's columns by R maps its stacked bases by A = R' (x) I_T;
+    # the projector onto their span becomes A Pi A', so D'(A x) = A D(x) for an
+    # orthogonal R. A non-orthogonal R changes the metric: no equivariance.
+    rng = np.random.default_rng(1)
+    T, groups = 5, [[0, 2], [1], [3]]
+    S = [rng.normal(size=(T, 2)), rng.normal(size=(T, 3)), rng.normal(size=(T, 2))]
+    S.append(np.zeros((T, 0)))
+    R = {
+        "orthogonal": np.linalg.qr(rng.normal(size=(2, 2)))[0],
+        "permutation": np.eye(2)[[1, 0]],
+        "not orthogonal": np.array([[1.0, 0.8], [0.0, 1.5]]),
+    }[kind]
+    grouping = _groups.check_grouping(groups, 4)
+    blocks = mmle._blocks(S, grouping)
+    cols = [slice(blocks.bounds[p], blocks.bounds[p + 1]) for p in (0, 2)]
+
+    def recode(x: FloatArray) -> FloatArray:
+        Z = x.reshape(T, -1).copy()
+        a, c = Z[:, cols[0]].copy(), Z[:, cols[1]].copy()
+        Z[:, cols[0]], Z[:, cols[1]] = (
+            R[0, 0] * a + R[1, 0] * c,
+            R[0, 1] * a + R[1, 1] * c,
+        )
+        return Z.ravel()
+
+    recoded = blocks._replace(S=recode(blocks.S.ravel()).reshape(T, -1))
+    stretch = mmle._span_maps(blocks, 30.0)[0]
+    stretch_r = mmle._span_maps(recoded, 30.0)[0]
+    x = rng.normal(size=blocks.S.size)
+    error = _rel(stretch_r(recode(x)), recode(stretch(x)))
+    assert (error <= 1e-12) == equivariant, error
+
+
 @pytest.mark.parametrize("seed", range(3))
 def test_grouped_preconditioning_reaches_the_same_optimum_faster(seed: int) -> None:
     # A change of variables: the path changes, the optimum does not. Measured
@@ -684,10 +706,8 @@ def test_a_grouped_fit_checks_its_fields(change: dict[str, Any], match: str) -> 
     fit = MMLEFit.from_parameters(
         pr.stats, pr.S, pr.lam, pr.stats.Y_mean, groups=pr.groups
     )
-    fields = {name: getattr(fit, name) for name in fit.__dataclass_fields__}
-    fields.update(change)
     with pytest.raises(ParameterError, match=match):
-        MMLEFit(**fields)
+        MMLEFit(**{**fields_of(fit), **change})
 
 
 def test_a_fit_with_trivial_groups_stores_none_and_old_pickles_load() -> None:
@@ -775,7 +795,7 @@ def test_the_grouped_identifiable_count_is_the_jacobian_rank(
     # marginal mean and covariance, which depends on each group's bases only
     # through [S_p]_p [S_p]_p' (one gauge O_g per group).
     n, T, N = 3, 2, 8
-    grouping = _groups.check_grouping(groups, grouping_size(groups))
+    grouping = _groups.check_grouping(groups, sum(len(g) for g in groups))
     widths = grouping.column_ranks(ranks)
     rng = np.random.default_rng(sum(ranks) + 10 * ci + len(groups))
     X = rng.normal(size=(N, grouping.n_columns))
@@ -793,7 +813,7 @@ def test_the_grouped_identifiable_count_is_the_jacobian_rank(
             for a, b, w in zip(offsets, offsets[1:], widths, strict=False)
         ]
         out = []
-        Phi = dense.grouped_design(X, S, groups)
+        Phi = dense.design(X, S, groups)
         for i in range(n):
             Sigma = np.eye(N * T) / lam[i] + Phi @ Phi.T
             out.append(Sigma[np.triu_indices(N * T)])
@@ -815,10 +835,6 @@ def test_the_grouped_identifiable_count_is_the_jacobian_rank(
     assert rank == n_parameters_mmle(
         ranks, n, T, condition_independent=ci, groups=groups
     )
-
-
-def grouping_size(groups: list[list[int]]) -> int:
-    return sum(len(g) for g in groups)
 
 
 # ------------------------------------------------------------------ the SVD start
@@ -847,19 +863,65 @@ def test_grouped_svd_truncates_the_concatenated_blocks() -> None:
 
 
 def test_grouped_weighted_svd_is_the_row_weighted_truncation() -> None:
-    pr = Problem("one group of four", seed=21, N=80, n=10, T=4)
-    fit = fit_svd(pr.stats, [3], groups=pr.groups, precision_weighted=True)
-    plain = fit_svd(pr.stats, [3], groups=pr.groups)
-    assert fit.precision_weighted
-    resid = [
-        np.concatenate(fit.B, axis=1) - np.concatenate(plain.B_full, axis=1),
-        np.concatenate(plain.B, axis=1) - np.concatenate(plain.B_full, axis=1),
-    ]
-    # Each is the best rank-3 fit in its own norm, so neither beats the other in
-    # both: the weighted one is no better in the Frobenius norm.
-    assert np.linalg.norm(resid[0]) >= np.linalg.norm(resid[1]) - 1e-12
-    for p in range(4):
-        np.testing.assert_allclose(fit.B[p], fit.W[0] @ fit.S[p].T)
+    # (M18w) with (M58), from scratch: each neuron's least squares on its
+    # observed trials, d_i ~ sqrt(n_i lambda_i) with lambda_i = n_i T / RSS_i
+    # (unit root mean square), the SVD of D [B_hat_p]_p mapped back by D^-1.
+    # Heteroskedastic precisions and a mask, truncated below the true rank, so
+    # weighting changes the fit.
+    groups, ranks, T = [[0, 2, 3], [1]], [1, 1], 4
+    names = ["a", "b", "c", "d"]
+    sim = simulate(
+        n_neurons=12,
+        n_bins=T,
+        n_trials=150,
+        ranks={"g": 3, "b": 2},
+        regressor_names=names,
+        groups={"g": ["a", "c", "d"]},
+        noise_precision=np.geomspace(0.01, 100.0, 12),
+        drop_prob=0.3,
+        seed=4,
+    )
+    stats = sufficient_statistics(sim.Y_masked, sim.X, sim.mask)
+    beta, count, rss = np.zeros((12, 4, T)), np.zeros(12), np.zeros(12)
+    for i in range(12):
+        rows = sim.mask[:, i]
+        A = np.column_stack([sim.X[rows], np.ones(rows.sum())])
+        coef = np.linalg.lstsq(A, sim.Y[rows, i], rcond=None)[0]
+        beta[i], count[i] = coef[:4], rows.sum()
+        rss[i] = np.sum((sim.Y[rows, i] - A @ coef) ** 2)
+    d = np.sqrt(count * count * T / rss)
+    d /= np.sqrt(np.mean(d**2))
+    fit = fit_svd(stats, ranks, groups=groups, precision_weighted=True)
+    plain = fit_svd(stats, ranks, groups=groups)
+    errors = []
+    for g, (members, r) in enumerate(zip(groups, ranks, strict=True)):
+        joined = np.concatenate([beta[:, p] for p in members], axis=1)
+        U, s, Vt = np.linalg.svd(d[:, None] * joined, full_matrices=False)
+        sign = np.sign(U[np.argmax(np.abs(U), axis=0), np.arange(U.shape[1])])[:r]
+        root = np.sqrt(s[:r])
+        assert _rel(fit.W[g], U[:, :r] * sign * root / d[:, None]) <= ORACLE_RTOL
+        V = Vt[:r].T * sign * root
+        for j, p in enumerate(members):
+            assert _rel(fit.S[p], V[j * T : (j + 1) * T]) <= ORACLE_RTOL
+            assert _rel(fit.B_full[p], beta[:, p]) <= ORACLE_RTOL
+        errors.append(
+            [
+                np.linalg.norm(d[:, None] * (_joined(f.B, members) - joined))
+                for f in (fit, plain)
+            ]
+        )
+    # The group's D-weighted error is materially below the unweighted one's.
+    weighted, unweighted = errors[0]
+    assert weighted < (1 - WEIGHTED_GAIN) * unweighted
+
+
+#: The weighted truncation's relative improvement in its own norm, at least
+#: (measured 0.21).
+WEIGHTED_GAIN = 0.1
+
+
+def _joined(B: Any, members: list[int]) -> FloatArray:
+    return np.concatenate([B[p] for p in members], axis=1)
 
 
 def test_the_grouped_svd_start_is_invariant_to_orthogonal_recodings() -> None:

@@ -1,11 +1,10 @@
 r"""Regressor groups in the positional layers: which columns share one latent weight.
 
-A regressor group is a set of design columns whose coefficient matrices share one
-neural basis, $B_p=W_gS_p^\top$ for every column $p$ of group $g$
-(`docs/model.md` § 11). The positional layers ([`mtdr.mmle`][mtdr.mmle],
-[`mtdr.svd_fit`][mtdr.svd_fit], [`mtdr.aic`][mtdr.aic]) take `groups` as a
-sequence of sequences of column indices; [`Grouping`][mtdr._groups.Grouping]
-checks it. The name-level rules of [`MTDR(groups=...)`][mtdr.model.MTDR] live in
+The columns $p$ of a group $g$ share one neural basis, $B_p=W_gS_p^\top$
+(`docs/model.md` § 11). [`mtdr.mmle`][mtdr.mmle], [`mtdr.svd_fit`][mtdr.svd_fit]
+and [`mtdr.aic`][mtdr.aic] take `groups` as a sequence of sequences of column
+indices, checked here; the name-level rules of
+[`MTDR(groups=...)`][mtdr.model.MTDR] live in
 [`resolve_groups`][mtdr.data.resolve_groups].
 """
 
@@ -22,38 +21,29 @@ __all__ = ["Grouping", "as_grouping", "check_grouping", "require_ranks"]
 
 @dataclass(frozen=True)
 class Grouping:
-    """A partition of the columns `range(n_columns)` into ordered groups.
+    """A partition of `range(n_columns)`: `groups[g]` holds group `g`'s columns.
 
-    `groups[g]` holds group `g`'s columns in increasing order, and the groups
-    are ordered by their smallest column, so the order is a function of the
-    partition alone. Build one with [`check_grouping`][mtdr._groups.check_grouping].
-
-    Attributes
-    ----------
-    groups : tuple of tuple of int
-        The columns of each group.
+    Members are increasing and groups are ordered by their smallest column, so
+    the order is a function of the partition; build one with `check_grouping`.
     """
 
     groups: tuple[tuple[int, ...], ...]
 
     @property
     def n_groups(self) -> int:
-        """Number of groups."""
         return len(self.groups)
 
     @property
     def n_columns(self) -> int:
-        """Number of columns the groups partition."""
-        return sum(len(g) for g in self.groups)
+        return sum(self.sizes)
 
     @property
     def sizes(self) -> tuple[int, ...]:
-        r"""$\lvert g\rvert$, the number of columns of each group."""
         return tuple(len(g) for g in self.groups)
 
     @property
     def group_of(self) -> tuple[int, ...]:
-        """The group of each column, `(n_columns,)`."""
+        """The group of each column."""
         out = [0] * self.n_columns
         for g, members in enumerate(self.groups):
             for p in members:
@@ -62,22 +52,11 @@ class Grouping:
 
     @property
     def trivial(self) -> bool:
-        """Whether every group is a single column: the ungrouped model."""
-        return all(len(g) == 1 for g in self.groups)
+        """Whether every group is one column: the ungrouped model."""
+        return max(self.sizes) == 1
 
     def column_ranks(self, group_ranks: Sequence[int]) -> list[int]:
-        """Return each column's width, the rank of its group.
-
-        Parameters
-        ----------
-        group_ranks : sequence of int
-            One rank per group, in group order.
-
-        Returns
-        -------
-        list of int
-            `(n_columns,)`, the rank of each column's group.
-        """
+        """Each column's width, its group's rank; one rank per group."""
         if len(group_ranks) != self.n_groups:
             raise ParameterError(
                 f"{len(group_ranks)} ranks for {self.n_groups} groups; expected one "
@@ -87,46 +66,17 @@ class Grouping:
 
     @classmethod
     def singletons(cls, n_columns: int) -> Grouping:
-        """Every column its own group (the ungrouped model, kept explicit).
-
-        Parameters
-        ----------
-        n_columns : int
-            Number of columns, positive.
-
-        Returns
-        -------
-        Grouping
-            `((0,), (1,), ...)`.
-        """
+        """Every column alone, kept explicit (to force the tie in tests)."""
         return cls(tuple((p,) for p in range(n_columns)))
 
 
 def check_grouping(groups: object, n_columns: int | None) -> Grouping:
-    """Check `groups` and return its `Grouping`, trivial or not.
+    """Return the `Grouping` of `groups`, or raise a `ParameterError` naming the entry.
 
-    `groups` must be a sequence of non-empty sequences of column indices (ints,
-    not bools; a string is not a sequence) that partition `range(n_columns)`
-    (`range` of their total size when `n_columns` is `None`), ordered by their
-    smallest column. Members are sorted within each group; the order of the
-    groups is not changed, because positional ranks follow it.
-
-    Parameters
-    ----------
-    groups : object
-        The `groups` argument of a positional layer.
-    n_columns : int or None
-        The number of design columns, when known.
-
-    Returns
-    -------
-    Grouping
-        The checked partition.
-
-    Raises
-    ------
-    ParameterError
-        For any violation, naming the offending entry.
+    `groups` must be non-empty sequences of int column indices that partition
+    `range(n_columns)` (of their total size when `n_columns` is `None`),
+    ordered by smallest column: positional ranks follow that order, so it is
+    checked, not changed. Members are sorted.
     """
     entries = as_list(groups)
     if not entries:
@@ -143,7 +93,6 @@ def check_grouping(groups: object, n_columns: int | None) -> Grouping:
                 f"groups[{g}] must be a non-empty sequence of column indices; got "
                 f"{entry!r}"
             )
-        columns: list[int] = []
         for member in members:
             p = as_int(member)
             if p is None or p < 0 or (n_columns is not None and p >= n_columns):
@@ -155,8 +104,7 @@ def check_grouping(groups: object, n_columns: int | None) -> Grouping:
                 where = "twice" if seen[p] == g else f"in groups {seen[p]} and {g}"
                 raise ParameterError(f"column {p} appears {where} in groups")
             seen[p] = g
-            columns.append(p)
-        out.append(tuple(sorted(columns)))
+        out.append(tuple(sorted(p for p, h in seen.items() if h == g)))
     total = len(seen) if n_columns is None else n_columns
     missing = sorted(set(range(total)) - set(seen))
     if missing:
@@ -174,23 +122,10 @@ def check_grouping(groups: object, n_columns: int | None) -> Grouping:
 
 
 def as_grouping(groups: object, n_columns: int | None) -> Grouping | None:
-    """Check `groups`; `None` for `None` or a partition into single columns.
+    """`check_grouping`, but `None` for `None` or every column alone.
 
-    The positional layers treat a trivial grouping exactly as `groups=None`:
-    the same code path, the same numbers and fit objects whose `groups` is
-    `None`.
-
-    Parameters
-    ----------
-    groups : object
-        `None`, or a sequence of sequences of column indices.
-    n_columns : int or None
-        The number of design columns, when known.
-
-    Returns
-    -------
-    Grouping or None
-        The grouping, `None` when it is the ungrouped model.
+    The positional layers treat such a grouping exactly as `groups=None`: the
+    same code path, numbers and fit objects.
     """
     if groups is None:
         return None
@@ -205,35 +140,10 @@ def require_ranks(
     n_neurons: int,
     n_bins: int,
 ) -> list[int]:
-    r"""Check per-group ranks against their caps $\min(n,\lvert g\rvert T)$.
+    r"""Return one rank per group, each in $[0,\min(n,\lvert g\rvert T)]$, or raise.
 
-    Without a grouping each column is its own group and the messages are those
-    of the ungrouped layers.
-
-    Parameters
-    ----------
-    ranks : object
-        The `ranks` argument.
-    grouping : Grouping or None
-        The groups, `None` for single columns.
-    n_regressors : int or None
-        The number of columns, when the caller knows it (checked against the
-        number of ranks without a grouping).
-    n_neurons : int
-        $n$.
-    n_bins : int
-        $T$.
-
-    Returns
-    -------
-    list of int
-        The ranks, one per group.
-
-    Raises
-    ------
-    ParameterError
-        For a wrong number of ranks or a rank outside $[0,\min(n,\lvert
-        g\rvert T)]$, naming the group's columns.
+    Without a grouping the number of ranks is checked against `n_regressors`
+    (when given) and the messages are those of the ungrouped layers.
     """
     rank_list = require_int_vector("ranks", ranks, minimum=0)
     if grouping is None:
@@ -254,11 +164,11 @@ def require_ranks(
             f"ranks has {len(rank_list)} entries; expected one per group "
             f"({grouping.n_groups})"
         )
-    for g, (r, members) in enumerate(zip(rank_list, grouping.groups, strict=True)):
-        cap = min(n_neurons, len(members) * n_bins)
+    for g, (r, size) in enumerate(zip(rank_list, grouping.sizes, strict=True)):
+        cap = min(n_neurons, size * n_bins)
         if r > cap:
             raise ParameterError(
-                f"ranks[{g}] (the group of columns {list(members)}) is {r}, above "
-                f"min(n_neurons, {len(members)} * n_bins) = {cap}"
+                f"ranks[{g}] (the group of columns {list(grouping.groups[g])}) is {r}, "
+                f"above min(n_neurons, {size} * n_bins) = {cap}"
             )
     return rank_list

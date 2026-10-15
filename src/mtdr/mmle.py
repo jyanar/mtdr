@@ -199,9 +199,7 @@ _MAX_LISTED = 20
 class _Blocks(NamedTuple):
     """The bases side by side, `[S_1, ..., S_P]`, with each component's column.
 
-    With regressor groups, `latent` maps each (expanded) component to its latent
-    coordinate and `tie` is the 0/1 matrix $M$ of (M53); both are `None` for the
-    ungrouped model, whose latent coordinates are the components themselves.
+    With groups, also the latent map and the tie $M$ of (M53); `None` without.
     """
 
     S: FloatArray  # (T, r_exp) expanded components, column by column
@@ -218,9 +216,8 @@ def _blocks(
 ) -> _Blocks:
     """Stack the bases; with `grouping`, also the latent map and the tie (M53).
 
-    A grouping whose groups are all single columns still builds the tie (as
-    the identity), which the tests use to force the tied kernels; the public
-    functions pass `None` for it instead.
+    A trivial grouping builds the identity tie (the tests force it so); the
+    public functions pass `None` instead.
     """
     ranks = [int(s.shape[1]) for s in S]
     column = np.repeat(np.arange(len(S), dtype=np.int64), ranks)
@@ -275,11 +272,7 @@ def _tie_vector(u: FloatArray, blocks: _Blocks) -> FloatArray:
 def _push(
     mu: FloatArray, Cinv: FloatArray, blocks: _Blocks
 ) -> tuple[FloatArray, FloatArray]:
-    r"""Push the posterior forward to the components, (M54).
-
-    $\tilde\mu_i=M\mu_i$ and $MC_i^{-1}M^\top$, so that
-    $\tilde\Omega_i=\tilde\mu_i\tilde\mu_i^\top+MC_i^{-1}M^\top=M\Omega_iM^\top$.
-    """
+    r"""Push the posterior to the components: $M\mu_i$, $MC_i^{-1}M^\top$ (M54)."""
     if blocks.latent is None:
         return mu, Cinv
     lat = blocks.latent
@@ -394,11 +387,7 @@ def _posterior(
 
 
 class _State(NamedTuple):
-    """Everything the likelihood, its gradients and the posterior need at one point.
-
-    `Aexp` is over the expanded components; `K`, `u`, `Cinv` and `mu` are latent
-    (the same thing without groups).
-    """
+    """Everything the likelihood, its gradients and the posterior need at one point."""
 
     blocks: _Blocks
     Aexp: FloatArray  # (n, r_exp, r_exp)  A_i[g_j, g_k]
@@ -526,9 +515,8 @@ def _grad_bases(
     Column $k\in\mathcal R_p$ is
     $\sum_i\lambda_i\big[\sum_jS[:,j]\,A_i[g_j,g_k](\Omega_i)_{jk}
     -\xi_{i\langle p\rangle}(\mu_i)_k\big]$;
-    `xig` is $\xi_i(b)$ gathered by component, `xi[:, column, :]`. With groups
-    the moments are the pushed-forward $\tilde\mu_i$, $MC_i^{-1}M^\top$
-    (`_push`), which gives (M55).
+    `xig` is $\xi_i(b)$ gathered by component, `xi[:, column, :]`; with the
+    pushed-forward moments of `_push`, (M55).
     """
     H = np.einsum("i,ijk->jk", lam, Aexp * _second_moment(mu, Cinv))
     E = np.einsum("i,ikt,ik->tk", lam, xig, mu)
@@ -569,8 +557,7 @@ def marginal_log_likelihood(
     $\mathcal N(\mathbf 1\otimes b_i,\ \lambda_i^{-1}I+\Phi_i\Phi_i^\top)$,
     minus the ridge when `basis_ridge` $=g>0$ (the value is then the penalised
     objective, not a log-likelihood). A neuron never observed contributes 0.
-    With `groups`, $\Phi_i$ is the grouped design of (M52), whose latent
-    weights the columns of a group share.
+    With `groups`, $\Phi_i$ is the grouped design (M52).
 
     Parameters
     ----------
@@ -587,10 +574,9 @@ def marginal_log_likelihood(
         $g\ge0$, the ridge on the bases.
     groups : sequence of sequence of int, optional
         Regressor groups as column indices (keyword-only; `docs/model.md`
-        § 11): a partition of the columns, ordered by their smallest column.
-        The columns of a group share one latent weight vector, so their bases
-        must all have the group's rank as width. `None`, or every column
-        alone, is the ungrouped model, on the same code path.
+        § 11), a partition ordered by smallest column; a group's bases share
+        its rank as width. `None`, or every column alone, is the ungrouped
+        model, on the same code path.
 
     Returns
     -------
@@ -615,9 +601,8 @@ def marginal_log_likelihood(
     Notes
     -----
     Cost: $O(n\,r_{tot}^3+n\,P\,T\,r_{tot}+T\,r_{tot}^2)$ time (one batched
-    Cholesky factorisation and inverse) and $O(n\,r_{tot}^2)$ memory. With
-    groups, $O(n\,r_{\rm exp}^2r_{\rm lat}+n\,r_{\rm lat}^3+n\,P\,T\,r_{\rm
-    exp})$: the expanded Gram and its tie, then a latent Cholesky. The
+    Cholesky factorisation and inverse) and $O(n\,r_{tot}^2)$ memory (with
+    groups, `docs/model.md` § 11.2). The
     explained quadratic is evaluated as $\lambda_i^2u_i^\top C_i^{-1}u_i=\lVert
     z_i\rVert^2$ with the scaled solve $z_i=L_i^{-1}(\lambda_iu_i)$,
     $C_i=L_iL_i^\top$, so that only the whitened products $\lambda_iu_i$ and
@@ -639,14 +624,6 @@ def marginal_log_likelihood(
     >>> stats = sufficient_statistics(sim.Y, sim.X, sim.mask)
     >>> S = [sim.S["x0"], sim.S["x1"]]
     >>> ll = marginal_log_likelihood(S, sim.noise_precision, sim.intercept, stats)
-    >>> bool(np.isfinite(ll))
-    True
-
-    Both columns sharing one rank-2 weight vector:
-
-    >>> S2 = [np.ones((5, 2)), np.eye(5)[:, :2]]
-    >>> ll = marginal_log_likelihood(S2, sim.noise_precision, sim.intercept, stats,
-    ...                              groups=[[0, 1]])
     >>> bool(np.isfinite(ll))
     True
     """
@@ -677,9 +654,7 @@ def marginal_nll_grad_S(  # noqa: N802 - the public API name
 
     with $\mu_i$, $\Omega_i$ the posterior mean and second moment of the
     weights (M25): (M26b), the expected complete-data gradient, equal to the
-    reference's (M26a) identically. With `groups`, (M55): the same with
-    $(\Omega_i)_{[qp]}$ and $(\mu_i)_{[p]}$ the latent blocks of the groups of
-    $q$ and $p$.
+    reference's (M26a) identically; with `groups`, (M55).
 
     Parameters
     ----------
@@ -695,8 +670,7 @@ def marginal_nll_grad_S(  # noqa: N802 - the public API name
     basis_ridge : float
         $g\ge0$, the ridge on the bases.
     groups : sequence of sequence of int, optional
-        Regressor groups as column indices (keyword-only), as
-        `marginal_log_likelihood`.
+        As `marginal_log_likelihood`.
 
     Returns
     -------
@@ -776,9 +750,7 @@ def marginal_nll_grad_noise(
     stats : SufficientStats
         The statistics.
     groups : sequence of sequence of int, optional
-        Regressor groups as column indices (keyword-only), as
-        `marginal_log_likelihood`; $\mathcal E_i$ is then evaluated in the latent
-        coordinates.
+        As `marginal_log_likelihood`.
 
     Returns
     -------
@@ -841,8 +813,7 @@ def posterior_weights(
     $\xi_i(b)$, as `demoLearning.m` calls it (`mTDRdemo.m:155` passes the raw
     statistic, a bug; see `docs/differences-from-matlab.md`).
     $\hat W_p[i,:]=(\mu_i)_{[p]}$, and $\hat B_p=\hat W_pS_p^\top$ is (M37).
-    With `groups`, $w_i$ is the latent weight vector, one block per group
-    (M52), and $\hat B_p=\hat W_gS_p^\top$ for each column $p$ of group $g$.
+    With `groups`, $w_i$ has one block per group (M52).
 
     Parameters
     ----------
@@ -856,8 +827,7 @@ def posterior_weights(
     stats : SufficientStats
         The statistics.
     groups : sequence of sequence of int, optional
-        Regressor groups as column indices (keyword-only), as
-        `marginal_log_likelihood`.
+        As `marginal_log_likelihood`.
 
     Returns
     -------
@@ -941,9 +911,7 @@ def update_intercept(
     stats : SufficientStats
         The statistics.
     groups : sequence of sequence of int, optional
-        Regressor groups as column indices (keyword-only), as
-        `marginal_log_likelihood`: the same centred form with the grouped
-        design, (M57).
+        As `marginal_log_likelihood`; (M57).
 
     Returns
     -------
@@ -1012,10 +980,7 @@ def _basis_step(st: _State, lam_new: FloatArray, xi: FloatArray) -> _Blocks:
     $\mathcal G\,\mathcal S'^\top=\mathcal M$ with
     $\mathcal G_{jk}=\sum_i\lambda'_iA_i[g_j,g_k](\Omega'_i)_{jk}$ (symmetric
     positive definite) and $\mathcal M[k,:]=\sum_i\lambda'_i(\mu'_i)_k\,
-    \xi_i(b)_{\langle g_k\rangle}^\top$. With groups, (M56): the same system over
-    the expanded components with the pushed-forward moments $\tilde\mu'_i$,
-    $\tilde\Omega'_i$; every $S_p$ stays a free parameter, so it is the exact
-    conditional maximiser.
+    \xi_i(b)_{\langle g_k\rangle}^\top$; with groups, (M56).
     """
     blocks = st.blocks
     Cinv, mu, _, _ = _posterior(lam_new, st.K, st.u)
@@ -1139,9 +1104,8 @@ class MMLEFit:
     value of `n_parameters` (a caller may carry another count); the validated
     entry point is [`from_parameters`][mtdr.mmle.MMLEFit.from_parameters].
 
-    With regressor groups (`groups`, `docs/model.md` § 11), `ranks`, `W` and
-    the blocks of `W_cov` are per group, in group order, while `S` and `B` stay
-    per column: `S[p]` has the rank of its group, and `B[p] = W[g] @ S[p].T`.
+    With `groups` (`docs/model.md` § 11), `ranks`, `W` and the blocks of `W_cov`
+    are per group and `S`, `B` per column: `B[p] = W[g] @ S[p].T`.
 
     Attributes
     ----------
@@ -1187,9 +1151,7 @@ class MMLEFit:
         `(n_flagged,)` int, the neurons the SVD initializer solved by minimum
         norm; empty when the fit did not start from `fit_svd`.
     groups : tuple of tuple of int or None
-        The regressor groups as column indices, in group order; `None` when
-        every column is its own group (the ungrouped model, whatever the
-        constructor was given).
+        The groups as column indices; `None` when every column is alone.
 
     Examples
     --------
@@ -1328,11 +1290,7 @@ class MMLEFit:
             object.__setattr__(self, name, value)
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        """Restore a pickled object with its arrays read-only again.
-
-        A fit pickled before regressor groups existed has no `groups`: every
-        column is its own group.
-        """
+        """Restore a pickled object (one from 0.1.0 has no groups) read-only again."""
         state.setdefault("groups", None)
         restore_frozen(self, state)
 
@@ -1340,8 +1298,8 @@ class MMLEFit:
     def B(self) -> tuple[FloatArray, ...]:  # noqa: N802 - the model's name, (M37)
         r"""Per regressor, `(n_neurons, n_bins)` coefficients $\hat W_pS_p^\top$, (M37).
 
-        With groups, $\hat W_gS_p^\top$ for each column $p$ of group $g$. Derived
-        once on construction, read-only; frame-independent.
+        With groups, $\hat W_gS_p^\top$. Derived once on construction,
+        read-only; frame-independent.
         """
         out: tuple[FloatArray, ...] = self.__dict__["_B"]
         return out
@@ -1388,8 +1346,8 @@ class MMLEFit:
         S : sequence of array_like
             Per regressor, the `(n_bins, r_p)` bases, as
             [`marginal_log_likelihood`][mtdr.mmle.marginal_log_likelihood]; each `r_p`
-            at most `min(n_neurons, n_bins)`, as the count (M38a) requires
-            (with groups, each group's rank at most `min(n_neurons, |g| n_bins)`).
+            at most `min(n_neurons, n_bins)` (`|g| n_bins` with groups), as the
+            count (M38a) requires.
         noise_precision : array_like of shape (n_neurons,)
             $\lambda_i>0$, as `marginal_log_likelihood`.
         intercept : array_like of shape (n_neurons, n_bins), or None
@@ -1397,7 +1355,7 @@ class MMLEFit:
         basis_ridge : float
             $g\ge0$, for `objective`.
         groups : sequence of sequence of int, optional
-            Regressor groups as column indices, as `marginal_log_likelihood`.
+            As `marginal_log_likelihood`.
 
         Returns
         -------
@@ -1541,8 +1499,7 @@ def ecme(
 
     Each step conditionally maximises the expected complete-data or the
     marginal likelihood, so the marginal NLL (M24) does not increase; the
-    returned trace shows it. With `groups` the steps are (M30), (M56) and
-    (M57), in the latent coordinates of `docs/model.md` § 11.
+    returned trace shows it. With `groups`, (M30), (M56) and (M57).
 
     Parameters
     ----------
@@ -1575,15 +1532,12 @@ def ecme(
         iterate by iterate to $10^{-12}$, with the same number of sweeps, on
         the reference run recorded in `tests/fixtures/mmle.mat`. For parity
         fixtures only: the trace is not guaranteed monotone, and an increase is
-        not reported. Refused with a group of several columns (the MATLAB code
-        has no groups).
+        not reported. Refused with groups (the MATLAB code has none).
     verbose : int
         `0` silent; `1` one summary line; `2` also one line per iteration.
     groups : sequence of sequence of int, optional
-        Regressor groups as column indices (keyword-only), as
-        [`marginal_log_likelihood`][mtdr.mmle.marginal_log_likelihood]; they
-        must be `init`'s groups (`None` means every column alone, so a grouped
-        `init` needs `groups=init.groups`).
+        As [`marginal_log_likelihood`][mtdr.mmle.marginal_log_likelihood]:
+        `init`'s groups, so a grouped `init` needs `groups=init.groups`.
 
     Returns
     -------
@@ -1831,12 +1785,8 @@ def refine(
     verbose : int
         `0` silent; `1` one summary line; `2` also one line per iteration.
     groups : sequence of sequence of int, optional
-        Regressor groups as column indices (keyword-only), as
-        [`ecme`][mtdr.mmle.ecme]: `init`'s groups. The basis step then runs
-        over every column's basis with the gradient (M55), and
-        `basis_span_scale` stretches each group's stacked bases $[S_p]_{p\in g}$
-        inside their own span, where a grouped objective's soft directions
-        $S_p\to S_pM_g$ lie.
+        As [`ecme`][mtdr.mmle.ecme]; `basis_span_scale` then stretches each
+        group's stacked bases in their span (`docs/model.md` § 11.4).
 
     Returns
     -------
@@ -2126,68 +2076,28 @@ def _finite_or_inf(value: float, grad: FloatArray) -> tuple[float, Float1D]:
 def _span_maps(
     blocks: _Blocks, alpha: float
 ) -> tuple[Callable[[Float1D], Float1D], Callable[[Float1D], Float1D]]:
-    r"""Return $D$ and $D^{-1}$, which scale each block's span by $\alpha$.
+    r"""Return $D$ and $D^{-1}$, which scale each group's stacked bases in their span.
 
-    $D(Y)_p=(I+(\alpha-1)\Pi_p)Y_p$ with $\Pi_p$ the orthogonal projector onto
-    the span of the start's $S_p$, on flattened `(T, r_tot)` arrays; $D$ is
-    symmetric and $D^{-1}$ is the same with $1/\alpha$. In $y=D^{-1}s$ the
-    curvature along the in-span directions $S_pM_p$ is $\alpha^2$ times larger,
-    and every other direction's is unchanged. With groups, `_group_span_maps`.
-    """
-    if blocks.grouping is not None:
-        return _group_span_maps(blocks, alpha)
-    T, r = blocks.S.shape
-    eye = np.eye(T)
-    columns: list[slice] = []
-    up: list[FloatArray] = []  # I + (alpha - 1) Pi_p
-    down: list[FloatArray] = []  # I + (1 / alpha - 1) Pi_p
-    for p in range(len(blocks.bounds) - 1):
-        cols = slice(blocks.bounds[p], blocks.bounds[p + 1])
-        if cols.start == cols.stop:
-            continue
-        Q = scipy.linalg.orth(blocks.S[:, cols])
-        proj = Q @ Q.T
-        columns.append(cols)
-        up.append(eye + (alpha - 1.0) * proj)
-        down.append(eye + (1.0 / alpha - 1.0) * proj)
-
-    def apply(x: Float1D, factors: list[FloatArray]) -> Float1D:
-        X = np.array(x, dtype=np.float64).reshape(T, r)
-        for cols, M in zip(columns, factors, strict=True):
-            X[:, cols] = M @ X[:, cols]
-        out: Float1D = X.ravel()
-        return out
-
-    return (lambda y: apply(y, up)), (lambda s: apply(s, down))
-
-
-def _group_span_maps(
-    blocks: _Blocks, alpha: float
-) -> tuple[Callable[[Float1D], Float1D], Callable[[Float1D], Float1D]]:
-    r"""`_span_maps` for groups: each group's stacked bases scaled in their span.
-
-    The soft directions of a grouped basis objective are $S_p\to S_pM_g$ with
-    one $M_g$ for every column of the group, the directions of the stacked
-    $\tilde S_g=[S_p]_{p\in g}$ (`(|g| T, r_g)`) inside its own span. So
-    $D(Y)_g=(I+(\alpha-1)\Pi_g)\,[Y_p]_{p\in g}$, $\Pi_g$ the orthogonal
-    projector onto the span of the start's $\tilde S_g$; scaling each column's
-    span separately would also stretch the stiff directions $S_pM_p$ with
-    different $M_p$. $D$ is symmetric and $D^{-1}$ is the same with $1/\alpha$.
+    $D(Y)_g=(I+(\alpha-1)\Pi_g)[Y_p]_{p\in g}$ with $\Pi_g$ the orthogonal
+    projector onto the span of the start's stacked $[S_p]_{p\in g}$ (one column's
+    $S_p$ without groups), on flattened `(T, r_tot)` arrays; $D$ is symmetric
+    and $D^{-1}$ is the same with $1/\alpha$. In $y=D^{-1}s$ the curvature along
+    the in-span directions $S_pM_g$, one $M_g$ per group (`docs/model.md`
+    § 11.4), is $\alpha^2$ times larger, and every other direction's is unchanged.
     """
     T, r = blocks.S.shape
-    grouping = blocks.grouping
-    assert grouping is not None
+    P = len(blocks.bounds) - 1
+    groups = blocks.grouping.groups if blocks.grouping else [(p,) for p in range(P)]
     units: list[list[slice]] = []
-    up: list[FloatArray] = []
-    down: list[FloatArray] = []
-    for members in grouping.groups:
+    up: list[FloatArray] = []  # I + (alpha - 1) Pi_g
+    down: list[FloatArray] = []  # I + (1 / alpha - 1) Pi_g
+    for members in groups:
         cols = [slice(blocks.bounds[p], blocks.bounds[p + 1]) for p in members]
         if cols[0].start == cols[0].stop:
             continue
-        stacked = np.concatenate([blocks.S[:, c] for c in cols], axis=0)
-        Q = scipy.linalg.orth(stacked)
+        Q = scipy.linalg.orth(_stacked(blocks.S, cols))
         proj = Q @ Q.T
-        eye = np.eye(stacked.shape[0])
+        eye = np.eye(proj.shape[0])
         units.append(cols)
         up.append(eye + (alpha - 1.0) * proj)
         down.append(eye + (1.0 / alpha - 1.0) * proj)
@@ -2195,13 +2105,21 @@ def _group_span_maps(
     def apply(x: Float1D, factors: list[FloatArray]) -> Float1D:
         X = np.array(x, dtype=np.float64).reshape(T, r)
         for cols, M in zip(units, factors, strict=True):
-            Z = M @ np.concatenate([X[:, c] for c in cols], axis=0)
+            Z = M @ _stacked(X, cols)
             for j, c in enumerate(cols):
                 X[:, c] = Z[j * T : (j + 1) * T]
         out: Float1D = X.ravel()
         return out
 
     return (lambda y: apply(y, up)), (lambda s: apply(s, down))
+
+
+def _stacked(X: FloatArray, cols: list[slice]) -> FloatArray:
+    """Stack the column blocks `cols` of `X` vertically; one block is a view."""
+    if len(cols) == 1:
+        return X[:, cols[0]]
+    out: FloatArray = np.concatenate([X[:, c] for c in cols], axis=0)
+    return out
 
 
 def _optimize_bases(
@@ -2231,8 +2149,7 @@ def _optimize_bases(
     With `span_scale` $\alpha\ne1$, L-BFGS-B runs on $y$ with $S=D(y)$
     (`_span_maps`): the objective and the acceptance are unchanged, and `tol`
     applies to the gradient in $y$, $D(\nabla_S)$. A rejected run returns the
-    start exactly. With groups the variables are every column's basis, the
-    Gram and projection are tied (M53) and the gradient is (M55).
+    start exactly. With groups, (M53) and (M55).
     """
     column, r = blocks.column, blocks.S.shape[1]
     Aexp = _expand(A, column)
@@ -2296,7 +2213,7 @@ def _basis_magnitude(
     The objective $\tfrac12\sum_i[-n_iT\log\lambda_i+\lambda_i\upsilon_i+\log\lvert
     C_i\rvert-\lambda_i^2u_i^\top C_i^{-1}u_i]$ (plus the ridge) sums terms of both
     signs much larger than itself, so its evaluated value carries rounding of
-    about $\epsilon M$, not $\epsilon\lvert f\rvert$. `blocks` gives the tie.
+    about $\epsilon M$, not $\epsilon\lvert f\rvert$.
     """
     with np.errstate(over="ignore", invalid="ignore"):
         K = _tie(Aexp * (S.T @ S), blocks)
@@ -2362,8 +2279,7 @@ def _optimize_precision(
     as success if every scale-free residual
     $\lvert\lambda_i\mathcal E_i/(n_iT)-1\rvert$ at the installed point is at
     most `PRECISION_RESIDUAL_TOL`. Status-0 and status-1 ends are not
-    polished, so a converged step is unchanged. With groups, `K` and `u` are
-    the latent ones (M53).
+    polished, so a converged step is unchanged.
     """
     K = _tie(_expand(A, blocks.column) * (blocks.S.T @ blocks.S), blocks)
     u = _tie_vector(_project(xi, blocks), blocks)
@@ -2589,10 +2505,7 @@ def fit_mmle(
     verbose : int
         `0`, `1` or `2`, passed to `ecme` and `refine`.
     groups : sequence of sequence of int, optional
-        Regressor groups as column indices (keyword-only; `docs/model.md`
-        § 11): a partition of the columns ordered by their smallest column,
-        whose columns share one latent weight vector each. `None`, or every
-        column alone, is the ungrouped fit, on the same code path.
+        As [`marginal_log_likelihood`][mtdr.mmle.marginal_log_likelihood].
 
     Returns
     -------
@@ -2731,11 +2644,7 @@ def _evaluation_args(
     stats: object,
     groups: object = None,
 ) -> tuple[SufficientStats, _Blocks, FloatArray, FloatArray, FloatArray]:
-    """Validate the evaluators' arguments: stats, bases, precisions, centred stats.
-
-    `groups` (column indices) is checked against the columns, and the bases of
-    a group against each other's widths.
-    """
+    """Validate the evaluators' arguments: stats, groups, bases, precisions."""
     stats = _require_stats(stats)
     grouping = _groups.as_grouping(groups, stats.n_regressors)
     bases = _require_bases(S, stats.n_regressors, stats.n_bins)

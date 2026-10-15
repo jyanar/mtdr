@@ -15,9 +15,7 @@ The two likelihoods are different objects, so the AIC values of the two
 estimators are never comparable. `formula="reference"` gives the counts the
 MATLAB demo uses, for parity fixtures only.
 
-With regressor groups (`docs/model.md` § 11) the ranks are per group, and a
-group $g$ of $\lvert g\rvert$ columns counts as one coefficient matrix of size
-$n\times\lvert g\rvert T$, (M59)-(M60).
+With regressor groups (`docs/model.md` § 11) the ranks are per group, (M59)-(M60).
 """
 
 from __future__ import annotations
@@ -55,9 +53,7 @@ def n_parameters_svd(
     K_{svd}(r)=\sum_p r_p\,(n+T-r_p)+n\;\big[+\,nT\big].
     $$
 
-    With `groups`, `ranks` are per group and each group counts the dimension
-    of the rank-$r_g$ matrices of size $n\times\lvert g\rvert T$, (M59):
-    $\sum_gr_g(n+\lvert g\rvert T-r_g)+n\,[+\,nT]$.
+    With `groups`, (M59): $r_g(n+\lvert g\rvert T-r_g)$ per group instead.
 
     `"reference"` is the count in the MATLAB `SVDRegB_AIC`, (M20b),
     $K=(nP'+TP'-\sum r')\sum r'$, where, as in the demo, $P'$ and $r'$
@@ -82,10 +78,8 @@ def n_parameters_svd(
     formula : {"textbook", "reference"}
         Which count.
     groups : sequence of sequence of int, optional
-        The regressor groups as column indices (keyword-only): a partition of
-        the columns, the groups ordered by their smallest column. Only the
-        sizes $\lvert g\rvert$ enter the count; a partition into single columns
-        counts as `None` does.
+        Regressor groups as column indices (keyword-only), a partition ordered
+        by smallest column (`docs/model.md` § 11); only their sizes enter.
 
     Returns
     -------
@@ -109,19 +103,14 @@ def n_parameters_svd(
     >>> n_parameters_svd([2], 10, 5, groups=[[0, 1]])   # 2*(10 + 10 - 2) + 10 + 50
     96
     """
-    grouping = _groups.as_grouping(groups, None)
-    r, n, T = _counts_args(ranks, n_neurons, n_bins, grouping)
+    r, sizes, n, T = _counts_args(ranks, n_neurons, n_bins, groups)
     ci = as_bool("condition_independent", condition_independent)
     m = min(n, T)
     if formula == "textbook":
-        if grouping is None:
-            k = sum(rp * (n + T - rp) for rp in r) + n
-        else:
-            sizes = grouping.sizes
-            k = sum(rp * (n + s * T - rp) for rp, s in zip(r, sizes, strict=True)) + n
+        k = sum(rg * (n + s * T - rg) for rg, s in zip(r, sizes, strict=True)) + n
         return k + (m * (n + T - m) if ci else 0)
     if formula == "reference":
-        if grouping is not None:
+        if max(sizes) > 1:
             raise ParameterError(
                 "formula='reference' is the MATLAB code's count, kept for parity "
                 "fixtures; the MATLAB code has no regressor groups"
@@ -158,12 +147,9 @@ def n_parameters_mmle(
     integrated-out weights are not counted by either. Without the intercept
     the reference count drops the $nT$ entries of $b$ as well.
 
-    With `groups`, (M60): each of a group's $\lvert g\rvert$ bases has $Tr_g$
-    entries and the group has one gauge $S_p\to S_pO_g$ shared by its columns,
-    so `"identifiable"` is
-    $n+\sum_g\big(\lvert g\rvert Tr_g-\tfrac12r_g(r_g-1)\big)\,[+\,nT]$, and
-    `"reference"` is the length of the parameter vector,
-    $n+T\sum_g\lvert g\rvert r_g\,[+\,nT]$, the count `MTDR`'s search selects
+    With `groups`, (M60): a group's $\lvert g\rvert$ bases have $\lvert
+    g\rvert Tr_g$ entries and one shared gauge $S_p\to S_pO_g$; `"reference"`
+    is then the parameter vector's length, the count `MTDR`'s search selects
     with.
 
     Parameters
@@ -181,9 +167,7 @@ def n_parameters_mmle(
     formula : {"identifiable", "reference"}
         Which count.
     groups : sequence of sequence of int, optional
-        The regressor groups as column indices (keyword-only), as
-        [`n_parameters_svd`][mtdr.aic.n_parameters_svd]; both formulas accept
-        them.
+        As [`n_parameters_svd`][mtdr.aic.n_parameters_svd].
 
     Returns
     -------
@@ -205,20 +189,14 @@ def n_parameters_mmle(
     >>> n_parameters_mmle([3, 2], 100, 15, groups=[[0, 1, 2], [3]])  # 100+132+29+1500
     1761
     """
-    grouping = _groups.as_grouping(groups, None)
-    r, n, T = _counts_args(ranks, n_neurons, n_bins, grouping)
+    r, sizes, n, T = _counts_args(ranks, n_neurons, n_bins, groups)
     ci = as_bool("condition_independent", condition_independent)
-    intercept = n * T if ci else 0
-    sizes = (1,) * len(r) if grouping is None else grouping.sizes
+    entries = n + T * sum(s * rg for rg, s in zip(r, sizes, strict=True))
+    entries += n * T if ci else 0
     if formula == "identifiable":
-        if grouping is None:
-            return n + sum(T * rp - rp * (rp - 1) // 2 for rp in r) + intercept
-        bases = sum(
-            s * T * rp - rp * (rp - 1) // 2 for rp, s in zip(r, sizes, strict=True)
-        )
-        return n + bases + intercept
+        return entries - sum(rg * (rg - 1) // 2 for rg in r)
     if formula == "reference":
-        return n + T * sum(s * rp for rp, s in zip(r, sizes, strict=True)) + intercept
+        return entries
     raise ParameterError(
         f"formula must be 'identifiable' or 'reference'; got {formula!r}"
     )
@@ -269,11 +247,11 @@ def aic(log_likelihood: float, n_parameters: int) -> float:
 
 
 def _counts_args(
-    ranks: object,
-    n_neurons: object,
-    n_bins: object,
-    grouping: _groups.Grouping | None,
-) -> tuple[list[int], int, int]:
+    ranks: object, n_neurons: object, n_bins: object, groups: object
+) -> tuple[list[int], tuple[int, ...], int, int]:
+    """Return the checked ranks, the group sizes (ones without groups), n and T."""
     n = positive_int("n_neurons", n_neurons)
     T = positive_int("n_bins", n_bins)
-    return _groups.require_ranks(ranks, grouping, None, n, T), n, T
+    grouping = _groups.as_grouping(groups, None)
+    r = _groups.require_ranks(ranks, grouping, None, n, T)
+    return r, (1,) * len(r) if grouping is None else grouping.sizes, n, T
