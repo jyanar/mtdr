@@ -17,10 +17,9 @@ estimator and never fit anything:
   observation model (M3), (M9) the estimators are written for;
 - [`split_trials`][mtdr.data.split_trials] draws a trial split for held-out
   comparisons;
-- [`resolve_groups`][mtdr.data.resolve_groups] resolves `MTDR(groups=...)`
-  against the column names, and
-  [`categorical_design`][mtdr.data.categorical_design] codes a categorical
-  regressor as one group of orthonormal zero-sum columns (`docs/model.md` § 11).
+- [`resolve_groups`][mtdr.data.resolve_groups] and
+  [`categorical_design`][mtdr.data.categorical_design] serve regressor groups
+  (`docs/model.md` § 11).
 
 The package never centres or rescales `X` or `Y`.
 """
@@ -33,7 +32,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
-import scipy.linalg
 from numpy.typing import ArrayLike, NDArray
 
 from mtdr._args import (
@@ -41,6 +39,7 @@ from mtdr._args import (
     as_int,
     as_list,
     as_real,
+    real_array,
     require_names,
     require_non_negative_real,
 )
@@ -1229,19 +1228,16 @@ def resolve_groups(
 ) -> dict[str, tuple[str, ...]]:
     r"""Resolve regressor groups against the column names: every group, in order.
 
-    The single implementation of the rules of
-    [`MTDR(groups=...)`][mtdr.model.MTDR] (`docs/model.md` § 11): `fit` calls
-    it, and a caller can call it to order rank tuples before fitting. `groups`
-    maps each group name to its member columns; a column it does not list is
-    a group of its own, named after the column. Groups are ordered by their
-    smallest member's column index and members by column index, so the
-    mapping's insertion order is irrelevant.
+    The rules of [`MTDR(groups=...)`][mtdr.model.MTDR] (`docs/model.md` § 11),
+    which `fit` applies: a column `groups` does not list is a group of its own,
+    named after it; a group may be named after one of its own columns only.
+    Groups are ordered by their smallest member's column and members by
+    column, whatever the mapping's order.
 
     Parameters
     ----------
     regressor_names : sequence of str
-        The columns of `X`, in order (unique; `"intercept"` and `"total"` are
-        reserved).
+        The columns of `X`, in order.
     groups : mapping of str to sequence of str, or None
         Group name to member column names; `None` makes every column its own
         group.
@@ -1249,18 +1245,13 @@ def resolve_groups(
     Returns
     -------
     dict of str to tuple of str
-        Every group, single columns included, in group order: `{group:
-        (member, ...)}`.
+        `{group: (member, ...)}` for every group, in group order.
 
     Raises
     ------
     ParameterError
-        If `groups` is not a mapping; a group name is not a non-empty string
-        or is reserved; a member list is a bare string, empty, or holds a
-        non-string; a column is listed twice, within or across groups; a member
-        is not a column (the message lists the columns); a group name is a
-        column outside that group, including a column that is a group of its
-        own.
+        For a malformed `groups` (names, member lists, a column listed twice),
+        a member that is not a column, or a group named after another column.
 
     Examples
     --------
@@ -1311,7 +1302,7 @@ def resolve_groups(
 
 
 def _group_spec(groups: object) -> dict[str, tuple[str, ...]] | None:
-    """Check `groups` without the column names (`MTDR`'s constructor checks)."""
+    """Check `groups` without the column names, as `MTDR`'s constructor does."""
     if groups is None:
         return None
     if not isinstance(groups, Mapping):
@@ -1360,12 +1351,10 @@ def _group_spec(groups: object) -> dict[str, tuple[str, ...]] | None:
 class CategoricalDesign:
     r"""A categorical regressor coded as one group of orthonormal zero-sum columns.
 
-    Returned by [`categorical_design`][mtdr.data.categorical_design]. With
-    $L$ levels, one-hot indicators $D$ and a fixed basis $Q$ of shape
-    $(L, L-1)$ with orthonormal columns orthogonal to $\mathbf 1$, the design
-    is $X=DQ$ and the level responses of a fitted group are
-    $B_a=\sum_pQ_{ap}B_p$, which sum to zero over the levels
-    (`docs/model.md` § 11.7). Arrays are read-only, also after unpickling.
+    Returned by [`categorical_design`][mtdr.data.categorical_design]: with
+    $L$ levels and the basis $Q$, `(L, L - 1)`, the design is $X=DQ$ for the
+    one-hot indicators $D$ (`docs/model.md` § 11.7). Arrays are read-only, also
+    after unpickling.
 
     Attributes
     ----------
@@ -1380,7 +1369,7 @@ class CategoricalDesign:
     columns : tuple of str
         `(f"{name}_1", ..., f"{name}_{L-1}")`.
     X : numpy.ndarray
-        `(n_trials, L - 1)`, the coded values, $Q$'s row of each trial's level.
+        `(n_trials, L - 1)`, $Q$'s row of each trial's level.
     """
 
     name: str
@@ -1416,8 +1405,8 @@ class CategoricalDesign:
         Parameters
         ----------
         values : array_like
-            `(n_trials,)` labels, each one of `levels`. Levels absent from
-            `values` are allowed (held-out data may lack some).
+            `(n_trials,)` labels among `levels`, by the rules of
+            `categorical_design`; levels may be absent.
 
         Returns
         -------
@@ -1427,11 +1416,10 @@ class CategoricalDesign:
         Raises
         ------
         ValidationError
-            For values that are not 1-D, missing (`NaN` or `None`), or not
-            among `levels` (the message lists those labels).
+            As `categorical_design` for `values`, or for labels outside
+            `levels`.
         """
-        index = _level_index(values, self.levels, "values")
-        out: FloatArray = np.array(self.basis[index])
+        out: FloatArray = np.array(self.basis[_level_index(values, self.levels)])
         return out
 
     def rows(self) -> FloatArray:
@@ -1448,13 +1436,15 @@ class CategoricalDesign:
     def level_responses(self, model: MTDR) -> FloatArray:
         r"""Return each level's coefficient matrix $B_a=\sum_pQ_{ap}B_p$, (M61).
 
-        Add `model.intercept_` to obtain the level means; the responses sum to
-        zero over the levels.
+        Defined for any fitted model with the coding's columns, whether they
+        form one group or separate terms, so the two fits can be compared
+        level by level. Add `model.intercept_` for the level means; the
+        responses sum to zero over the levels.
 
         Parameters
         ----------
         model : MTDR
-            A fitted model in which the coding's columns form exactly one group.
+            A fitted model whose `regressor_names_` include `columns`.
 
         Returns
         -------
@@ -1464,96 +1454,19 @@ class CategoricalDesign:
         Raises
         ------
         ParameterError
-            Unless the coding's columns form exactly one group of `model`.
+            If the model lacks some of the columns (the message names them).
+        NotFittedError
+            If the model is not fitted.
         """
-        self._group_of(model)
+        model._check_fitted()
+        missing = [c for c in self.columns if c not in model.regressor_names_]
+        if missing:
+            raise ParameterError(
+                f"the model has no columns {missing} of {self.name!r}; its columns "
+                f"are {list(model.regressor_names_)}"
+            )
         B = np.stack([model.B_[column] for column in self.columns])
         out: FloatArray = np.einsum("ap,pit->ait", self.basis, B)
-        return out
-
-    def labels_from_rows(
-        self, values: Mapping[str, ArrayLike] | ArrayLike
-    ) -> np.ma.MaskedArray[Any, Any]:
-        """Map decoded rows back to level labels.
-
-        Parameters
-        ----------
-        values : mapping of str to array_like, or array_like
-            `MTDR.decode` output (a mapping that holds every column of the
-            coding; other keys are ignored), or an `(n_trials, L - 1)` array
-            with the columns in coding order.
-
-        Returns
-        -------
-        numpy.ma.MaskedArray
-            `(n_trials,)` labels, masked where the decoded row is `NaN` (a
-            trial the decoder could not decode).
-
-        Raises
-        ------
-        ValidationError
-            If a row is not within $10^{-9}$ of the basis scale of a level's
-            row (the message lists the first such trials), or the input has the
-            wrong shape or misses a column.
-        """
-        rows = self._decoded_rows(values)
-        missing = np.isnan(rows).any(axis=1)
-        with np.errstate(invalid="ignore"):
-            distance = np.abs(rows[:, None, :] - self.basis[None, :, :]).max(axis=2)
-        distance = np.where(np.isnan(distance), np.inf, distance)
-        nearest = np.argmin(distance, axis=1)
-        tol = 1e-9 * float(np.abs(self.basis).max())
-        closest = distance[np.arange(rows.shape[0]), nearest]
-        off = np.flatnonzero(~missing & ~(closest <= tol))
-        if off.size:
-            raise ValidationError(
-                f"decoded rows of trials {_listed(off)} match no level of "
-                f"{self.name!r} to within {tol:.3g}; decode with "
-                f"levels={{{self.name!r}: design.rows()}} to obtain level rows"
-            )
-        labels = self.levels[np.where(missing, 0, nearest)]
-        return np.ma.MaskedArray(labels, mask=missing)
-
-    def _group_of(self, model: MTDR) -> str:
-        """Return the group of `model` whose columns are exactly this coding's."""
-        model._check_fitted()
-        wanted = set(self.columns)
-        found = [g for g, members in model.groups_.items() if set(members) == wanted]
-        if len(found) != 1:
-            owners = sorted(
-                {g for g, members in model.groups_.items() if wanted & set(members)}
-            )
-            raise ParameterError(
-                f"the columns {list(self.columns)} of {self.name!r} do not form one "
-                f"group of the model (they are in groups {owners}); fit with "
-                f"groups={{{self.name!r}: {list(self.columns)}}}"
-            )
-        return found[0]
-
-    def _decoded_rows(self, values: object) -> FloatArray:
-        k = len(self.columns)
-        if isinstance(values, Mapping):
-            absent = [c for c in self.columns if c not in values]
-            if absent:
-                raise ValidationError(
-                    f"values lacks the columns {absent} of {self.name!r}; pass the "
-                    "output of decode for the whole group"
-                )
-            parts = [_as_array(f"values[{c!r}]", values[c]) for c in self.columns]
-            if any(p.ndim != 1 or p.shape != parts[0].shape for p in parts):
-                raise ValidationError(
-                    "the decoded values of the group's columns must be 1-D arrays of "
-                    "one length"
-                )
-            arr = np.stack(parts, axis=1)
-        else:
-            arr = _as_array("values", values)
-        if arr.dtype.kind not in "iuf" or arr.ndim != 2 or arr.shape[1] != k:
-            raise ValidationError(
-                f"values must be a real (n_trials, {k}) array or decode's mapping; got "
-                f"dtype {arr.dtype}, shape {arr.shape}"
-            )
-        out: FloatArray = arr.astype(np.float64)
         return out
 
 
@@ -1562,41 +1475,38 @@ def categorical_design(
     levels: ArrayLike | None = None,
     *,
     name: str,
-    basis: Literal["polynomial", "helmert"] | ArrayLike = "polynomial",
+    basis: Literal["polynomial"] | ArrayLike = "polynomial",
 ) -> CategoricalDesign:
     r"""Code a categorical regressor as one regressor group, `docs/model.md` § 11.7.
 
     With $L$ levels the coding has $L-1$ columns, the rows of a fixed basis $Q$
-    with orthonormal columns that sum to zero, $Q^\top Q=I$ and
-    $Q^\top\mathbf 1=0$; fitted as one group
-    (`MTDR(groups=design.groups)`), the levels' responses $B_a$ share one
-    neural basis and sum to zero, (M61). Zero is the equally weighted average
-    of the levels, not a reference level or the trial-weighted mean.
+    with $Q^\top Q=I$ and $Q^\top\mathbf 1=0$. Fitted as one group
+    (`MTDR(groups=design.groups)`), the level responses (M61) share one neural
+    basis and sum to zero: zero is the equally weighted average of the levels,
+    not a reference level or the trial-weighted mean.
 
     Parameters
     ----------
     values : array_like
-        `(n_trials,)` labels: numbers, strings or booleans, no missing values.
+        `(n_trials,)` labels: all real numbers, all strings or all booleans.
+        Missing values (`None`, `NaN`, `pandas.NA`, masked entries) and other
+        objects are refused; the string `"nan"` is an ordinary label.
     levels : array_like, optional
-        The levels in coding order, distinct, at least two; levels absent from
-        `values` are allowed. `None` takes the sorted distinct values.
+        The distinct levels in coding order, at least two, by the same rules;
+        levels absent from `values` are allowed. `None` takes the sorted
+        distinct values.
     name : str
         The group's name (keyword-only); the columns are `name_1`, ...,
         `name_{L-1}`.
-    basis : {"polynomial", "helmert"} or array_like
+    basis : "polynomial" or array_like
         $Q$. `"polynomial"`: the orthonormal polynomials of the level indices
-        $0,\dots,L-1$, the $Q$ factor of the QR decomposition of the
-        Vandermonde matrix $[1,x,\dots,x^{L-1}]$ without its constant column,
-        each signed so that its leading coefficient is positive (computed by
-        the three-term recurrence, which is stable for any $L$; for five
-        levels these are the familiar linear, quadratic, cubic and quartic
-        columns divided by their norms). `"helmert"`: the normalised Helmert
-        basis, `scipy.linalg.helmert(L).T` (column $j$ compares level $j+1$
-        with the mean of the levels before it). An array: an $(L, L-1)$
-        finite basis, zero-sum to rounding and orthonormal to $10^{-10}$. Any
-        orthonormal zero-sum basis gives the same fitted model (§ 11.9); a
-        coding that is not orthonormal can still be fitted as plain columns
-        with `MTDR(groups=...)`, at the cost of the invariances of § 11.9.
+        $0,\dots,L-1$, i.e. the $Q$ factor of the Vandermonde matrix
+        $[1,x,\dots,x^{L-1}]$ without its constant column, leading coefficients
+        positive (computed by a stable three-term recurrence; for five levels,
+        the linear, quadratic, cubic and quartic columns divided by their
+        norms). An array: a finite real $(L, L-1)$ basis, zero-sum and
+        orthonormal to $10^{-10}$. Any such basis gives the same fitted model
+        (§ 11.9).
 
     Returns
     -------
@@ -1606,14 +1516,13 @@ def categorical_design(
     Raises
     ------
     ValidationError
-        For `values` that are not 1-D, missing, or outside `levels`; fewer
-        than two levels; levels that repeat, are missing or cannot be sorted
-        (pass `levels`).
+        For `values` or `levels` that are not 1-D, hold missing or unsupported
+        labels (the message lists their positions), or mix kinds; values
+        outside `levels`; fewer than two levels or repeated levels.
     ParameterError
-        For a bad `name` (empty, not a string, reserved, or column names that
-        are not valid regressor names) or `basis` (an array that is not
-        orthonormal and zero-sum: `scipy.linalg.orth` of a centred coding
-        gives one).
+        For a bad `name` (empty, not a string, reserved) or `basis` (complex,
+        the wrong shape, or not orthonormal and zero-sum:
+        `scipy.linalg.orth(C - C.mean(axis=0))` gives one for a coding `C`).
 
     Examples
     --------
@@ -1634,12 +1543,7 @@ def categorical_design(
         raise ParameterError(f"name {name!r} is reserved")
     labels = _labels(values, "values")
     if levels is None:
-        try:
-            level_arr = np.unique(labels)
-        except TypeError as err:
-            raise ValidationError(
-                f"the values cannot be sorted ({err}); pass levels in coding order"
-            ) from err
+        level_arr = np.unique(labels)
     else:
         level_arr = _labels(levels, "levels")
         if len(set(level_arr.tolist())) != level_arr.size:
@@ -1651,13 +1555,13 @@ def categorical_design(
             f"{level_arr.tolist()}"
         )
     columns = require_names([f"{name}_{j}" for j in range(1, L)], L - 1)
-    Q = _categorical_basis(basis, L)
-    index = _level_index(labels, level_arr, "values")
-    counts = np.bincount(index, minlength=L).astype(np.int64)
+    polynomial = isinstance(basis, str) and basis == "polynomial"
+    Q = _polynomial_basis(L) if polynomial else _basis(basis, L)
+    index = _level_index(labels, level_arr)
     return CategoricalDesign(
         name=name,
-        levels=np.array(level_arr),
-        counts=counts,
+        levels=level_arr,
+        counts=np.bincount(index, minlength=L).astype(np.int64),
         basis=Q,
         columns=columns,
         X=np.array(Q[index]),
@@ -1665,74 +1569,79 @@ def categorical_design(
 
 
 def _labels(values: object, what: str) -> NDArray[Any]:
-    """Return labels as a 1-D array without missing entries, else raise."""
-    arr = _as_array(what, values)
-    if arr.ndim != 1:
+    """Return categorical labels as a 1-D array, or raise `ValidationError`.
+
+    Each original scalar, before any conversion that could turn a `NaN` into
+    the string `"nan"` or drop a mask, must be a finite real number, a string
+    or a boolean, all of one kind.
+    """
+    data: Any = values
+    if isinstance(values, np.ma.MaskedArray):
+        masked = np.ma.getmaskarray(values)
+        if masked.any():
+            raise ValidationError(
+                f"{what} has masked labels at {_listed(np.flatnonzero(masked))}; "
+                "drop those trials"
+            )
+        data = values.data
+    items = np.array(data, dtype=object)
+    if items.ndim != 1:
         raise ValidationError(
-            f"{what} must be 1-D, one label per trial; got shape {arr.shape}"
+            f"{what} must be 1-D, one label per trial; got shape {items.shape}"
         )
-    if arr.dtype.kind not in "biufUSO":
+    kinds = [_label_kind(v) for v in items]
+    bad = [k for k, kind in enumerate(kinds) if kind is None]
+    if bad:
         raise ValidationError(
-            f"{what} must hold numbers, strings or booleans; got dtype {arr.dtype}"
+            f"{what} has missing or unsupported labels at {_listed(bad)}: "
+            f"{_listed(repr(items[k]) for k in bad)}; labels are finite real "
+            "numbers, strings or booleans, none missing"
         )
-    if arr.dtype.kind in "fc":
-        missing = np.isnan(arr)
-    elif arr.dtype.kind == "O":
-        missing = np.array(
-            [v is None or (isinstance(v, float) and np.isnan(v)) for v in arr.tolist()],
-            dtype=bool,
-        )
-    else:
-        missing = np.zeros(arr.shape, dtype=bool)
-    if missing.any():
-        raise ValidationError(
-            f"{what} has missing labels (NaN or None) at "
-            f"{_listed(np.flatnonzero(missing))}"
-        )
-    return arr
+    found = sorted({str(kind) for kind in kinds})
+    if len(found) > 1:
+        raise ValidationError(f"{what} mixes {' and '.join(found)}; use one kind")
+    return np.array(items.tolist()) if items.size else np.array([])
 
 
-def _level_index(values: object, levels: NDArray[Any], what: str) -> IntArray:
+def _label_kind(value: object) -> str | None:
+    """`"booleans"`, `"numbers"` or `"strings"`; `None` for anything else."""
+    if isinstance(value, bool | np.bool_):
+        return "booleans"
+    if isinstance(value, str):
+        return "strings"
+    if isinstance(value, int | np.integer):
+        return "numbers"
+    if isinstance(value, float | np.floating):
+        return "numbers" if np.isfinite(value) else None
+    return None
+
+
+def _level_index(values: object, levels: NDArray[Any]) -> IntArray:
     """Return each value's level index; raise listing the labels outside `levels`."""
-    labels = _labels(values, what)
+    labels = _labels(values, "values").tolist()
     lookup = {level: k for k, level in enumerate(levels.tolist())}
-    index = [lookup.get(v, -1) for v in labels.tolist()]
-    outside = sorted(
-        {repr(v) for v, k in zip(labels.tolist(), index, strict=True) if k < 0}
-    )
+    index = [lookup.get(v, -1) for v in labels]
+    outside = sorted({repr(v) for v, k in zip(labels, index, strict=True) if k < 0})
     if outside:
         raise ValidationError(
-            f"{what} holds labels {_listed(outside)} that are not among the levels "
+            f"values holds labels {_listed(outside)} that are not among the levels "
             f"{levels.tolist()}"
         )
-    out: IntArray = np.array(index, dtype=np.int64)
-    return out
+    return np.array(index, dtype=np.int64)
 
 
 #: An explicit categorical basis must be orthonormal and zero-sum to this.
 _BASIS_TOLERANCE = 1e-10
 
 
-def _categorical_basis(basis: object, L: int) -> FloatArray:
-    """Return the `(L, L - 1)` basis `basis` names or gives, checked."""
-    if isinstance(basis, str):
-        if basis == "polynomial":
-            return _polynomial_basis(L)
-        if basis == "helmert":
-            out: FloatArray = np.ascontiguousarray(scipy.linalg.helmert(L).T)
-            return out
+def _basis(basis: object, L: int) -> FloatArray:
+    """Return an explicit `(L, L - 1)` basis, checked; complex is refused."""
+    Q = real_array(basis)
+    if Q is None or Q.shape != (L, L - 1) or not np.isfinite(Q).all():
+        got = "a non-real or ragged array" if Q is None else f"shape {Q.shape}"
         raise ParameterError(
-            f"basis must be 'polynomial', 'helmert' or an (L, L - 1) array; got "
-            f"{basis!r}"
-        )
-    try:
-        Q = np.array(basis, dtype=np.float64)
-    except (TypeError, ValueError) as err:
-        raise ParameterError(f"basis is not a real array: {err}") from err
-    if Q.shape != (L, L - 1) or not np.isfinite(Q).all():
-        raise ParameterError(
-            f"basis must be a finite (L, L - 1) = ({L}, {L - 1}) array; got shape "
-            f"{Q.shape}"
+            f"basis must be 'polynomial' or a finite real (L, L - 1) = ({L}, "
+            f"{L - 1}) array; got {repr(basis) if isinstance(basis, str) else got}"
         )
     sums = float(np.abs(Q.sum(axis=0)).max())
     gram = float(np.abs(Q.T @ Q - np.eye(L - 1)).max())
@@ -1740,8 +1649,7 @@ def _categorical_basis(basis: object, L: int) -> FloatArray:
         raise ParameterError(
             "basis must have orthonormal columns that sum to zero (column sums up to "
             f"{sums:.3g}, |Q'Q - I| up to {gram:.3g}); scipy.linalg.orth(C - "
-            "C.mean(axis=0)) gives such a basis for a coding C. A coding that is "
-            "not orthonormal can be fitted as plain columns with MTDR(groups=...)"
+            "C.mean(axis=0)) gives such a basis for a coding C"
         )
     return Q
 
@@ -1749,10 +1657,10 @@ def _categorical_basis(basis: object, L: int) -> FloatArray:
 def _polynomial_basis(L: int) -> FloatArray:
     r"""Orthonormal polynomials of the indices $0,\dots,L-1$, constant dropped.
 
-    The three-term (Stieltjes) recurrence with a full re-orthogonalisation,
-    on the indices centred and scaled to $[-1, 1]$ (the same polynomials): the
-    $Q$ factor of the Vandermonde matrix's QR decomposition, signed so that
-    each leading coefficient is positive, without its ill-conditioning.
+    The three-term (Stieltjes) recurrence with a full re-orthogonalisation, on
+    the indices scaled to $[-1, 1]$ (the same polynomials): the Vandermonde
+    matrix's $Q$ factor, leading coefficients positive, without its
+    ill-conditioning.
     """
     x = np.linspace(-1.0, 1.0, L)
     Q = np.zeros((L, L))

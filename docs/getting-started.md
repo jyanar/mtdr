@@ -110,11 +110,16 @@ for label, m in (("shared", shared), ("separate", separate)):
     print(f"held-out log-likelihood, {label}:",
           round(m.log_likelihood(cat.Y[test], cat.X[test], cat.mask[test]), 1))
 
-levels = coding.level_responses(shared)  # (5, n_neurons, n_bins); sums to zero
-print("level responses:", levels.shape)
+true = np.einsum("ap,pit->ait", coding.basis, np.stack([cat.B[c] for c in coding.columns]))
+for label, m in (("shared", shared), ("separate", separate)):
+    levels = coding.level_responses(m)  # (5, n_neurons, n_bins); sums to zero
+    print(f"level-response error, {label}:",
+          round(np.linalg.norm(levels - true) / np.linalg.norm(true), 3))
 out = shared.decode(cat.Y[test], None, mask=cat.mask[test],
                     levels={"sa": coding.rows(), "choice": [-1, 1]})
-print("Sa decoding accuracy:", np.mean(coding.labels_from_rows(out) == sa[test]))
+rows = np.column_stack([out[c] for c in coding.columns])
+decoded = coding.levels[np.argmin(np.abs(rows[:, None] - coding.rows()).sum(axis=2), axis=1)]
+print("Sa decoding accuracy:", np.mean(decoded == sa[test]))
 ```
 
 - `groups:` every group in group order; `choice` is a group of its own. `W_["sa"]` is
@@ -123,10 +128,10 @@ print("Sa decoding accuracy:", np.mean(coding.labels_from_rows(out) == sa[test])
 - `total rank`: the shared basis counts once, 2 + 1, against 4 × 2 + 1 for separate
   terms. Equal ranks are not equal parameter counts: compare groupings by held-out
   likelihood, as here.
-- `level responses`: $B_a=\sum_pQ_{ap}B_p$ for each level (model (M61)); add
-  `intercept_` for the level means.
+- `level-response error`: $B_a=\sum_pQ_{ap}B_p$ for each level (model (M61)), against
+  the simulation's, for both fits; add `intercept_` for the level means.
 - `Sa decoding accuracy`: `levels={"sa": coding.rows()}` enumerates the five levels'
-  rows as one discrete unit, and `labels_from_rows` maps the decoded rows back to labels.
+  rows as one discrete unit; each decoded row is one of them.
 
 Missing data are marked per neuron and trial (`mask`): without a mask, one `NaN`
 bin makes that neuron unobserved on that trial, its finite bins included. To fit

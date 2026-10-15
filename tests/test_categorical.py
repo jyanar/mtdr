@@ -2,8 +2,9 @@
 
 The polynomial basis is checked against the five-level columns used for Sa
 (linear, quadratic, cubic, quartic, each of norm sqrt(10)) and against the QR
-decomposition of the Vandermonde matrix; encoding and decoding round-trip;
-`level_responses` is checked against a dense reconstruction.
+decomposition of the Vandermonde matrix; labels are validated before any
+conversion could hide a missing value; `level_responses` is checked against a
+dense reconstruction.
 """
 
 from __future__ import annotations
@@ -60,9 +61,7 @@ def test_many_levels_stay_orthonormal() -> None:
     np.testing.assert_allclose(basis.sum(axis=0), 0, atol=1e-12)
 
 
-def test_helmert_and_an_explicit_basis() -> None:
-    helmert = categorical_design(["a", "b", "c"], name="h", basis="helmert")
-    np.testing.assert_allclose(helmert.basis, scipy.linalg.helmert(3).T)
+def test_an_explicit_basis() -> None:
     Q = scipy.linalg.orth(np.eye(4) - 0.25)
     given = categorical_design([0, 1, 2, 3], name="q", basis=Q)
     np.testing.assert_array_equal(given.basis, Q)
@@ -72,10 +71,13 @@ def test_helmert_and_an_explicit_basis() -> None:
 @pytest.mark.parametrize(
     ("basis", "match"),
     [
-        ("legendre", "basis must be 'polynomial', 'helmert'"),
-        (np.ones((4, 4)), r"finite \(L, L - 1\) = \(4, 3\) array"),
+        ("helmert", "basis must be 'polynomial' or a finite real"),
+        (np.ones((4, 4)), r"finite real \(L, L - 1\) = \(4, 3\) array; got shape"),
         (np.full((4, 3), np.nan), "finite"),
-        ([["a"] * 3] * 4, "not a real array"),
+        ([["a"] * 3] * 4, "a non-real or ragged array"),
+        ([[1.0] * 3] * 3 + [[1.0]], "a non-real or ragged array"),
+        # A complex matrix whose real part is a valid basis: refused, not cast.
+        ((1 + 1j) * scipy.linalg.helmert(4).T / np.sqrt(2), "non-real"),
         (np.eye(4)[:, :3], r"scipy.linalg.orth\(C - C.mean"),
         (2 * scipy.linalg.helmert(4).T, "sum to zero"),
     ],
@@ -113,43 +115,64 @@ def test_codes_counts_and_groups() -> None:
     assert booleans.levels.tolist() == [False, True]
 
 
-def test_encode_and_labels_round_trip() -> None:
+def test_encode() -> None:
     design = categorical_design(["a", "b", "c", "d"], name="g")
-    values = np.array(["c", "a", "d", "d", "b"])
-    X = design.encode(values)
+    X = design.encode(np.array(["c", "a", "d", "d", "b"]))
     assert X.flags.writeable
-    labels = design.labels_from_rows(X)
-    assert isinstance(labels, np.ma.MaskedArray)
-    assert labels.tolist() == values.tolist()
+    np.testing.assert_array_equal(X, design.basis[[2, 0, 3, 3, 1]])
     # Levels absent from the values are allowed in encode.
     assert design.encode(["a"]).shape == (1, 3)
-    # Decode's mapping, NaN rows masked; extra keys ignored.
-    rows = dict(zip(design.columns, X.T, strict=True))
-    rows["g_2"] = rows["g_2"].copy()
-    for c in design.columns:
-        rows[c] = rows[c].copy()
-        rows[c][1] = np.nan
-    rows["other"] = np.zeros(5)
-    masked = design.labels_from_rows(rows)
-    assert masked.mask.tolist() == [False, True, False, False, False]
-    assert masked.compressed().tolist() == ["c", "d", "d", "b"]
+    # The string "nan" is an ordinary label; so is an unmasked masked array.
+    words = categorical_design(["nan", "low", "nan"], name="w")
+    assert words.levels.tolist() == ["low", "nan"]
+    assert words.encode(np.ma.array(["low"], mask=[False])).shape == (1, 1)
 
 
-@pytest.mark.parametrize(
-    ("values", "match"),
-    [
-        (["a", "e", "f"], r"labels \['e', 'f'\] that are not among the levels"),
-        ([[0, 1], [1, 0]], "must be 1-D"),
-        (np.array([0.0, np.nan]), r"missing labels \(NaN or None\) at \[1\]"),
-        (np.array(["a", None], dtype=object), r"missing labels .* at \[1\]"),
-        (np.array([1 + 1j]), "numbers, strings or booleans"),
-        ([[1, 2], [3]], "ragged"),
-    ],
-)
-def test_encode_rejects(values: Any, match: str) -> None:
+#: Missing or unsupported labels, refused where they were silently coded.
+MISSING: list[tuple[Any, str]] = [
+    (["low", np.nan, "high"], r"missing or unsupported labels at \[1\]: \[nan\]"),
+    (np.array(["a", None], dtype=object), r"at \[1\]: \[None\]"),
+    ([0.0, float("nan")], r"at \[1\]"),
+    ([1.0, np.inf], r"at \[1\]"),
+    ([1 + 1j, 2], r"at \[0\]"),
+    ([{"a": 1}, "b"], r"at \[0\]"),
+    ([[1, 2], [3]], r"at \[0, 1\]"),
+    (
+        np.ma.array(["A", "B", "C"], mask=[False, True, False]),
+        r"masked labels at \[1\]",
+    ),
+    ([1, "a"], "mixes numbers and strings"),
+    ([True, 0], "mixes booleans and numbers"),
+    ([[0, 1], [1, 0]], "must be 1-D"),
+]
+
+
+@pytest.mark.parametrize(("values", "match"), MISSING)
+def test_missing_or_unsupported_labels_are_refused(values: Any, match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        categorical_design(values, name="c")
+    with pytest.raises(ValidationError, match=match):
+        categorical_design(["a", "b"], levels=values, name="c")
     design = categorical_design(["a", "b", "c", "d"], name="g")
     with pytest.raises(ValidationError, match=match):
         design.encode(values)
+
+
+def test_pandas_missing_values_are_refused() -> None:
+    pd = pytest.importorskip("pandas")
+    labels = np.array([0, pd.NA], dtype=object)
+    with pytest.raises(ValidationError, match=r"at \[1\]: \[<NA>\]"):
+        categorical_design(labels, name="c")
+    with pytest.raises(ValidationError, match=r"at \[1\]"):
+        categorical_design([0, 1], levels=labels, name="c")
+    with pytest.raises(ValidationError, match=r"at \[1\]"):
+        categorical_design(pd.Series(["a", None, "b"]), name="c")
+
+
+def test_encode_rejects_labels_outside_the_levels() -> None:
+    design = categorical_design(["a", "b", "c", "d"], name="g")
+    with pytest.raises(ValidationError, match=r"labels \['e', 'f'\] that are not"):
+        design.encode(["a", "e", "f"])
 
 
 @pytest.mark.parametrize(
@@ -158,11 +181,6 @@ def test_encode_rejects(values: Any, match: str) -> None:
         ({"values": [1, 1, 1]}, ValidationError, "at least two levels"),
         ({"values": [1, 2], "levels": [1, 2, 1]}, ValidationError, "repeat a level"),
         ({"values": [1, 2, 3], "levels": [1, 2]}, ValidationError, r"labels \[3\]"),
-        (
-            {"values": np.array([1, "a"], dtype=object)},
-            ValidationError,
-            "cannot be sorted",
-        ),
         ({"values": [1, 2], "name": ""}, ParameterError, "non-empty string"),
         ({"values": [1, 2], "name": 3}, ParameterError, "non-empty string"),
         ({"values": [1, 2], "name": "total"}, ParameterError, "reserved"),
@@ -175,20 +193,6 @@ def test_categorical_design_rejects(
     kw = {"name": "c", **kw}
     with pytest.raises(error, match=match):
         categorical_design(**kw)
-
-
-def test_labels_from_rows_refuses_rows_that_match_no_level() -> None:
-    design = categorical_design([0, 1, 2], name="c")
-    X = design.encode([0, 2])
-    X[1, 0] += 1e-6
-    with pytest.raises(ValidationError, match=r"trials \[1\] match no level"):
-        design.labels_from_rows(X)
-    with pytest.raises(ValidationError, match="lacks the columns"):
-        design.labels_from_rows({"c_1": X[:, 0]})
-    with pytest.raises(ValidationError, match="one length"):
-        design.labels_from_rows({"c_1": X[:, 0], "c_2": X[:1, 1]})
-    with pytest.raises(ValidationError, match=r"real \(n_trials, 2\) array"):
-        design.labels_from_rows(np.zeros((2, 3)))
 
 
 def _fit(seed: int, groups: Any) -> tuple[MTDR, mtdr.CategoricalDesign]:
@@ -231,9 +235,14 @@ def test_level_responses_match_a_dense_reconstruction() -> None:
     )
 
 
-def test_level_responses_need_the_coding_as_one_group() -> None:
+def test_level_responses_of_separate_terms_and_missing_columns() -> None:
+    # The sum over the coding is defined for separate-term fits as well.
     model, design = _fit(1, None)
-    with pytest.raises(ParameterError, match="do not form one group"):
-        design.level_responses(model)
+    responses = design.level_responses(model)
+    want = np.einsum("ap,pit->ait", design.basis, np.stack(list(model.B_.values())))
+    np.testing.assert_allclose(responses, want, atol=1e-13)
+    other = categorical_design(["w", "x", "y", "z", "v"], name="stim")
+    with pytest.raises(ParameterError, match=r"no columns \['stim_4'\] of 'stim'"):
+        other.level_responses(model)
     with pytest.raises(mtdr.NotFittedError):
         design.level_responses(MTDR())

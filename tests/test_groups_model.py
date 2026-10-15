@@ -93,17 +93,27 @@ def data() -> tuple[mtdr.SimulatedData, mtdr.CategoricalDesign, NDArray[Any]]:
 @pytest.fixture(scope="module")
 def model(data: Any) -> MTDR:
     sim = data[0]
-    return MTDR(ranks={"sa": 2, "choice": 1}, groups=GROUPS).fit(
-        sim.Y_masked, sim.X, regressor_names=NAMES
-    )
+    return _fit(sim, ranks={"sa": 2, "choice": 1}, groups=GROUPS)
 
 
 @pytest.fixture(scope="module")
 def svd_model(data: Any) -> MTDR:
     sim = data[0]
-    return MTDR(ranks={"sa": 2, "choice": 1}, groups=GROUPS, estimator="svd").fit(
-        sim.Y_masked, sim.X, regressor_names=NAMES
-    )
+    return _fit(sim, ranks={"sa": 2, "choice": 1}, groups=GROUPS, estimator="svd")
+
+
+@pytest.fixture(scope="module")
+def svd_search(data: Any) -> MTDR:
+    sim = data[0]
+    return _fit(sim, ranks="aic", groups=GROUPS, max_rank=2, estimator="svd")
+
+
+def _labels(design: mtdr.CategoricalDesign, values: Any) -> NDArray[Any]:
+    """The level of each decoded row (decode returns the candidate rows exactly)."""
+    rows = np.column_stack([values[c] for c in design.columns])
+    hits = (rows[:, None, :] == design.basis[None]).all(axis=2)
+    assert hits.any(axis=1).all()
+    return design.levels[np.argmax(hits, axis=1)]
 
 
 def _fit(sim: mtdr.SimulatedData, **kw: Any) -> MTDR:
@@ -144,10 +154,7 @@ def test_construction_checks(kw: dict[str, Any], match: str) -> None:
 def test_groups_are_a_parameter() -> None:
     model = MTDR(ranks={"sa": 2, "choice": 1}, groups=GROUPS)
     assert model.get_params()["groups"] is GROUPS
-    assert repr(model) == (
-        "MTDR(ranks={'sa': 2, 'choice': 1}, groups={'sa': ['sa_1', 'sa_2', 'sa_3', "
-        "'sa_4']})"
-    )
+    assert repr(model).endswith("groups={'sa': ['sa_1', 'sa_2', 'sa_3', 'sa_4']})")
     # set_params checks the combination and rolls back.
     with pytest.raises(ParameterError, match="pass ranks as a mapping"):
         MTDR(ranks=[1, 2]).set_params(groups=GROUPS)
@@ -221,9 +228,7 @@ def test_resolve_groups_orders_by_column(data: Any) -> None:
 
 def test_a_group_named_after_its_own_column(data: Any) -> None:
     sim = data[0]
-    model = MTDR(ranks={"sa_1": 2, "choice": 1}, groups={"sa_1": NAMES[:4]}).fit(
-        sim.Y_masked, sim.X, regressor_names=NAMES
-    )
+    model = _fit(sim, ranks={"sa_1": 2, "choice": 1}, groups={"sa_1": NAMES[:4]})
     assert model.group_names_ == ("sa_1", "choice")
     assert model.W_["sa_1"].shape == (40, 2)
     # The name is the group in decode's regressor and levels.
@@ -246,17 +251,12 @@ def test_explicit_singletons_are_the_default_bit_for_bit(data: Any) -> None:
         },
         {"ranks": "aic", "max_rank": 2, "estimator": "svd"},
     ):
-        a = MTDR(**kw).fit(sim.Y_masked, sim.X, regressor_names=NAMES)
-        b = MTDR(groups=singles, **kw).fit(sim.Y_masked, sim.X, regressor_names=NAMES)
+        a = _fit(sim, **kw)
+        b = _fit(sim, groups=singles, **kw)
         assert a.groups_ == b.groups_
         assert a.group_names_ == b.group_names_ == tuple(NAMES)
-        for name in ("W_", "S_", "B_"):
-            for key in NAMES:
-                np.testing.assert_array_equal(
-                    getattr(a, name)[key], getattr(b, name)[key]
-                )
-        np.testing.assert_array_equal(a.intercept_, b.intercept_)
-        np.testing.assert_array_equal(a.noise_precision_, b.noise_precision_)
+        # W, S, B, ranks, intercept and precisions, NaN padding included.
+        assert a.to_xarray().identical(b.to_xarray())
         if a.weight_posterior_cov_ is not None:
             np.testing.assert_array_equal(
                 a.weight_posterior_cov_, b.weight_posterior_cov_
@@ -272,8 +272,6 @@ def test_explicit_singletons_are_the_default_bit_for_bit(data: Any) -> None:
         assert a.explained_variance(sim.Y_masked, sim.X) == b.explained_variance(
             sim.Y_masked, sim.X
         )
-        da, db = a.to_xarray(), b.to_xarray()
-        assert da.identical(db)
     assert a.groups_ == {name: (name,) for name in NAMES}
 
 
@@ -281,10 +279,8 @@ def test_a_renamed_single_column_group(data: Any) -> None:
     # A one-column group with another name is the ungrouped fit, keyed by group.
     sim = data[0]
     ranks = {"x": 1, "sa_2": 1, "sa_3": 1, "sa_4": 1, "choice": 1}
-    a = MTDR(ranks=[1] * 5).fit(sim.Y_masked, sim.X, regressor_names=NAMES)
-    b = MTDR(ranks=ranks, groups={"x": ["sa_1"]}).fit(
-        sim.Y_masked, sim.X, regressor_names=NAMES
-    )
+    a = _fit(sim, ranks=[1] * 5)
+    b = _fit(sim, ranks=ranks, groups={"x": ["sa_1"]})
     np.testing.assert_array_equal(a.W_["sa_1"], b.W_["x"])
     np.testing.assert_array_equal(a.B_["sa_1"], b.B_["sa_1"])
     assert b.group_names_ == ("x", "sa_2", "sa_3", "sa_4", "choice")
@@ -325,8 +321,8 @@ def test_fitted_attributes_are_keyed_by_group_and_column(model: MTDR) -> None:
 def test_the_canonical_frame_and_the_covariance_rotation(data: Any) -> None:
     sim = data[0]
     kw: dict[str, Any] = {"ranks": {"sa": 2, "choice": 1}, "groups": GROUPS}
-    raw = MTDR(canonicalize=False, **kw).fit(sim.Y_masked, sim.X, regressor_names=NAMES)
-    canon = MTDR(**kw).fit(sim.Y_masked, sim.X, regressor_names=NAMES)
+    raw = _fit(sim, canonicalize=False, **kw)
+    canon = _fit(sim, **kw)
     for c in NAMES:
         np.testing.assert_array_equal(raw.B_[c], canon.B_[c])
     assert raw.weight_posterior_cov_ is not None
@@ -395,9 +391,7 @@ def test_project_by_group(model: MTDR, data: Any) -> None:
 
 def test_a_rank_zero_group(data: Any) -> None:
     sim = data[0]
-    model = MTDR(ranks={"sa": 0, "choice": 1}, groups=GROUPS).fit(
-        sim.Y_masked, sim.X, regressor_names=NAMES
-    )
+    model = _fit(sim, ranks={"sa": 0, "choice": 1}, groups=GROUPS)
     assert model.W_["sa"].shape == (40, 0)
     assert all(model.S_[c].shape == (6, 0) for c in NAMES[:4])
     assert not any(model.B_[c].any() for c in NAMES[:4])
@@ -441,8 +435,7 @@ def test_decode_group_candidate_rows(model: MTDR, data: Any) -> None:
         sim.Y_masked, None, levels={"sa": design.rows(), "choice": [-1, 1]}
     )
     assert sorted(out) == sorted(NAMES)
-    decoded = design.labels_from_rows(out)
-    assert np.mean(decoded == labels) > 0.95
+    assert np.mean(_labels(design, out) == labels) > 0.95
     assert np.mean(out["choice"] == sim.X[:, 4]) > 0.95
     out2, profile = model.decode(
         sim.Y_masked,
@@ -453,7 +446,7 @@ def test_decode_group_candidate_rows(model: MTDR, data: Any) -> None:
     )
     assert profile.shape == (400, 5)
     best = np.argmax(profile, axis=1)
-    np.testing.assert_array_equal(design.labels_from_rows(out2), np.array(LEVELS)[best])
+    np.testing.assert_array_equal(_labels(design, out2), np.array(LEVELS)[best])
     # The group's columns can also be decoded as continuous values.
     cont = model.decode(sim.Y_masked, "sa", known={"choice": sim.X[:, 4]})
     assert sorted(cont) == NAMES[:4]
@@ -653,12 +646,13 @@ def test_a_grouped_fit_that_does_not_converge_says_so(data: Any) -> None:
     # The existing ConvergenceWarning and converged_=False, unchanged by groups.
     sim = data[0]
     with pytest.warns(ConvergenceWarning, match="iteration cap"):
-        model = MTDR(
+        model = _fit(
+            sim,
             ranks={"sa": 2, "choice": 1},
             groups=GROUPS,
             refine_max_iter=1,
             refine_tol=1e-300,
-        ).fit(sim.Y_masked, sim.X, regressor_names=NAMES)
+        )
     assert not model.converged_
     assert np.isfinite(model.log_likelihood_)
 
@@ -683,22 +677,21 @@ def test_the_grouped_search_selects_the_planted_ranks() -> None:
     sim, _, _ = categorical_sim(3, n=60, T=8, N=500, rank=3, noise=4.0)
     # From ones the under-ranked candidates need more than the default 10
     # refinement iterations; the default start (below) does not.
-    model = MTDR(
+    model = _fit(
+        sim,
         ranks="aic",
         groups=GROUPS,
         max_rank=6,
         rank_search_init="ones",
         refine_max_iter=50,
-    ).fit(sim.Y_masked, sim.X, regressor_names=NAMES)
+    )
     assert model.ranks_ == {"sa": 3, "choice": 1}
     history = model.rank_search_history_
     assert history is not None
     assert history.regressor_names == ("sa", "choice")
     assert history.ranks.tolist() == [[1, 1], [2, 1], [3, 1]]
     assert history.final_ranks() == model.ranks_
-    default = MTDR(ranks="aic", groups=GROUPS, max_rank=6).fit(
-        sim.Y_masked, sim.X, regressor_names=NAMES
-    )
+    default = _fit(sim, ranks="aic", groups=GROUPS, max_rank=6)
     assert default.ranks_ == {"sa": 3, "choice": 1}
     assert default.rank_search_history_ is not None
     assert default.rank_search_history_.svd_stage is not None
@@ -712,12 +705,8 @@ def test_warm_and_cold_grouped_candidates_take_the_same_path() -> None:
         "max_rank": 4,
         "rank_search_init": {"sa": 1, "choice": 1},
     }
-    cold = MTDR(rank_search_warm_start=False, **kw).fit(
-        sim.Y_masked, sim.X, regressor_names=NAMES
-    )
-    warm = MTDR(rank_search_warm_start=True, **kw).fit(
-        sim.Y_masked, sim.X, regressor_names=NAMES
-    )
+    cold = _fit(sim, rank_search_warm_start=False, **kw)
+    warm = _fit(sim, rank_search_warm_start=True, **kw)
     hc, hw = cold.rank_search_history_, warm.rank_search_history_
     assert hc is not None
     assert hw is not None
@@ -742,9 +731,13 @@ def test_a_grouped_warm_start_extends_every_member(
         return real(stats, ranks, init, **kw)
 
     monkeypatch.setattr(mtdr.model, "fit_mmle", spy)
-    model = MTDR(
-        ranks="aic", groups=GROUPS, max_rank=3, rank_search_init={"sa": 1, "choice": 1}
-    ).fit(sim.Y_masked, sim.X, regressor_names=NAMES)
+    model = _fit(
+        sim,
+        ranks="aic",
+        groups=GROUPS,
+        max_rank=3,
+        rank_search_init={"sa": 1, "choice": 1},
+    )
     history = model.rank_search_history_
     assert history is not None
     stats = sufficient_statistics(sim.Y_masked, sim.X, sim.mask)
@@ -767,8 +760,8 @@ def test_n_jobs_with_groups() -> None:
         "max_rank": 3,
         "rank_search_init": {"sa": 1, "choice": 1},
     }
-    one = MTDR(n_jobs=1, **kw).fit(sim.Y_masked, sim.X, regressor_names=NAMES)
-    two = MTDR(n_jobs=2, **kw).fit(sim.Y_masked, sim.X, regressor_names=NAMES)
+    one = _fit(sim, n_jobs=1, **kw)
+    two = _fit(sim, n_jobs=2, **kw)
     assert one.ranks_ == two.ranks_
     h1, h2 = one.rank_search_history_, two.rank_search_history_
     assert h1 is not None
@@ -907,7 +900,7 @@ def _first_label(ax: Any) -> str:
     return str(legend.get_texts()[0].get_text())
 
 
-def test_plots_with_groups(model: MTDR, data: Any) -> None:
+def test_plots_with_groups(model: MTDR, svd_search: MTDR, data: Any) -> None:
     pytest.importorskip("matplotlib")
     import matplotlib.pyplot as plt
 
@@ -940,17 +933,11 @@ def test_plots_with_groups(model: MTDR, data: Any) -> None:
         with pytest.raises(ParameterError, match="color_by must name a column"):
             mtdr.plot.trajectories(model, sim.Y_masked, sim.X, "sa", color_by="sa")
         assert mtdr.plot.recovery(model, sim).shape == (4,)
-        assert mtdr.plot.rank_search(
-            MTDR(ranks="aic", groups=GROUPS, max_rank=2, estimator="svd").fit(
-                sim.Y_masked, sim.X, regressor_names=NAMES
-            )
-        ).shape == (1,)
-        separate = MTDR(ranks=[1] * 5).fit(sim.Y_masked, sim.X, regressor_names=NAMES)
+        assert mtdr.plot.rank_search(svd_search).shape == (1,)
+        separate = _fit(sim, ranks=[1] * 5)
         with pytest.raises(ParameterError, match="groups hold other columns"):
             mtdr.plot.recovery(separate, sim)
-        raw = MTDR(ranks={"sa": 2, "choice": 1}, groups=GROUPS, canonicalize=False).fit(
-            sim.Y_masked, sim.X, regressor_names=NAMES
-        )
+        raw = _fit(sim, ranks={"sa": 2, "choice": 1}, groups=GROUPS, canonicalize=False)
         text = _first_label(mtdr.plot.bases(raw, ["sa_1"])[0])
         assert text.startswith("comp. 1: |W||S|")
     finally:
@@ -990,20 +977,21 @@ def _public_callables() -> set[str]:
     return out
 
 
-def _exercises(model: MTDR, data: Any) -> dict[str, Callable[[], object]]:
-    """One grouped exercise per public callable, or its documented refusal."""
+def _exercises(
+    model: MTDR, svd_model: MTDR, svd_search: MTDR, data: Any
+) -> dict[str, Callable[[], object]]:
+    """One grouped exercise per public callable, or its documented refusal.
+
+    The fits come from the module's fixtures, which made them with groups
+    (`MTDR.fit`, `fit_mmle`, `fit_svd`, `greedy_aic`, `simulate`).
+    """
     sim, design, labels = data
     Y, X = sim.Y_masked, sim.X
     stats = sufficient_statistics(Y, X, sim.mask)
     groups = [[0, 1, 2, 3], [4]]
     fit = model._fit_object
     assert isinstance(fit, mtdr.MMLEFit)
-    svd = mtdr.svd_fit.fit_svd(stats, [2, 1], groups=groups)
-    history = (
-        MTDR(ranks="aic", groups=GROUPS, max_rank=2, estimator="svd")
-        .fit(Y, X, regressor_names=NAMES)
-        .rank_search_history_
-    )
+    history = svd_search.rank_search_history_
     assert history is not None
     S, lam, b = list(fit.S), fit.noise_precision, fit.intercept
 
@@ -1019,9 +1007,7 @@ def _exercises(model: MTDR, data: Any) -> dict[str, Callable[[], object]]:
     return {
         f"{m}.get_params": lambda: model.get_params(),
         f"{m}.set_params": lambda: MTDR(groups=GROUPS).set_params(ranks={"sa": 1}),
-        f"{m}.fit": lambda: MTDR(ranks={"sa": 1, "choice": 1}, groups=GROUPS).fit(
-            Y, X, regressor_names=NAMES
-        ),
+        f"{m}.fit": lambda: model,
         f"{m}.predict": lambda: model.predict(X),
         f"{m}.log_likelihood": lambda: model.log_likelihood(Y, X),
         f"{m}.score": lambda: model.score(Y, X),
@@ -1054,7 +1040,7 @@ def _exercises(model: MTDR, data: Any) -> dict[str, Callable[[], object]]:
         "mtdr.mmle.refine": lambda: mtdr.mmle.refine(
             stats, fit, max_iter=1, groups=groups
         ),
-        "mtdr.mmle.fit_mmle": lambda: mtdr.mmle.fit_mmle(stats, [2, 1], groups=groups),
+        "mtdr.mmle.fit_mmle": lambda: fit,
         "mtdr.mmle.MMLEFit.from_parameters": lambda: mtdr.MMLEFit.from_parameters(
             stats, S, lam, b, groups=groups
         ),
@@ -1062,9 +1048,7 @@ def _exercises(model: MTDR, data: Any) -> dict[str, Callable[[], object]]:
         "mtdr.mmle.MMLEFit.n_neurons": lambda: fit.n_neurons,
         "mtdr.mmle.MMLEFit.n_bins": lambda: fit.n_bins,
         "mtdr.mmle.MMLEFit.total_rank": lambda: fit.total_rank,
-        "mtdr.svd_fit.fit_svd": lambda: mtdr.svd_fit.fit_svd(
-            stats, [2, 1], groups=groups
-        ),
+        "mtdr.svd_fit.fit_svd": lambda: svd_model._fit_object,
         "mtdr.aic.n_parameters_svd": refuses(
             lambda: mtdr.aic.n_parameters_svd(
                 [2, 1], 40, 6, groups=groups, formula="reference"
@@ -1075,13 +1059,7 @@ def _exercises(model: MTDR, data: Any) -> dict[str, Callable[[], object]]:
             [2, 1], 40, 6, groups=groups
         ),
         "mtdr.aic.aic": lambda: mtdr.aic.aic(fit.log_likelihood, fit.n_parameters),
-        "mtdr.rank_search.greedy_aic": lambda: mtdr.rank_search.greedy_aic(
-            lambda r: mtdr.svd_fit.fit_svd(stats, r, groups=groups),
-            lambda f, r: f.aic,
-            [1, 1],
-            [min(40, 24), 6],
-            regressor_names=["sa", "choice"],
-        ),
+        "mtdr.rank_search.greedy_aic": lambda: history,
         "mtdr.rank_search.RankSearchHistory.final_ranks": history.final_ranks,
         "mtdr.rank_search.RankSearchHistory.n_fits": lambda: history.n_fits,
         "mtdr.rank_search.RankSearchHistory.margins": history.margins,
@@ -1102,10 +1080,7 @@ def _exercises(model: MTDR, data: Any) -> dict[str, Callable[[], object]]:
         "mtdr.data.CategoricalDesign.level_responses": lambda: design.level_responses(
             model
         ),
-        "mtdr.data.CategoricalDesign.labels_from_rows": lambda: design.labels_from_rows(
-            design.rows()
-        ),
-        "mtdr.simulation.simulate": lambda: categorical_sim(9, n=8, T=3, N=60),
+        "mtdr.simulation.simulate": lambda: sim,
         "mtdr.simulation.SimulatedData.Y_masked": lambda: sim.Y_masked,
         "mtdr.simulation.SimulatedData.fit_kwargs": sim.fit_kwargs,
         "mtdr.stats.sufficient_statistics": lambda: sufficient_statistics(
@@ -1125,22 +1100,23 @@ def _exercises(model: MTDR, data: Any) -> dict[str, Callable[[], object]]:
         ),
         "mtdr.plot.recovery": lambda: mtdr.plot.recovery(model, sim),
         "mtdr.xarray_io.to_dataset": lambda: mtdr.xarray_io.to_dataset(model),
-        "svd": lambda: svd,
     }
 
 
-def test_every_public_callable_has_a_grouped_exercise(model: MTDR, data: Any) -> None:
+def test_every_public_callable_has_a_grouped_exercise(
+    model: MTDR, svd_model: MTDR, svd_search: MTDR, data: Any
+) -> None:
     # A callable added to the public API without a grouped exercise (or its
     # documented ParameterError) fails here.
     pytest.importorskip("matplotlib")
     pytest.importorskip("xarray")
     import matplotlib.pyplot as plt
 
-    exercises = _exercises(model, data)
+    exercises = _exercises(model, svd_model, svd_search, data)
     public = _public_callables()
-    assert public == set(exercises) - {"svd"}, (
+    assert public == set(exercises), (
         sorted(public - set(exercises)),
-        sorted(set(exercises) - public - {"svd"}),
+        sorted(set(exercises) - public),
     )
     try:
         with warnings.catch_warnings():

@@ -13,6 +13,7 @@ import numbers
 from collections.abc import Sequence
 
 import numpy as np
+from numpy.typing import NDArray
 
 from mtdr.errors import ParameterError
 
@@ -68,6 +69,18 @@ def as_list(value: object) -> list[object] | None:
     if isinstance(value, str | bytes) or not isinstance(value, Sequence):
         return None
     return list(value)
+
+
+def real_array(value: object) -> NDArray[np.float64] | None:
+    """`value` as a new `float64` array if it is real; `None` if ragged or not real.
+
+    Booleans and complex numbers are not real here.
+    """
+    try:
+        arr = np.asarray(value)
+    except (TypeError, ValueError):
+        return None
+    return arr.astype(np.float64) if arr.dtype.kind in "iuf" else None
 
 
 def as_bool(name: str, value: object) -> bool:

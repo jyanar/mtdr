@@ -37,11 +37,10 @@ only its session's neurons, as in the recorded data.
 [`categorical_design`][mtdr.data.categorical_design] codes $L$ levels as $L-1$
 orthonormal, zero-sum columns and returns a
 [`CategoricalDesign`][mtdr.data.CategoricalDesign]: its `X` for the design, its `groups`
-for `MTDR(groups=...)`, `encode` for held-out trials, `rows()` for decoding the level,
-`labels_from_rows` to map decoded rows back to labels, and `level_responses(model)` for
-each level's coefficient matrix ([model §11.7](../model.md#117-categorical-regressors)).
-Any orthonormal zero-sum basis gives the same fitted model; the polynomial and Helmert
-bases differ only in what each column means. A coding that is not orthonormal (indicators
+for `MTDR(groups=...)`, `encode` for held-out trials, `rows()` for decoding the level, and
+`level_responses(model)` for each level's coefficient matrix, from a grouped or a
+separate-term fit ([model §11.7](../model.md#117-categorical-regressors)). Any orthonormal
+zero-sum basis gives the same fitted model. A coding that is not orthonormal (indicators
 with a level dropped, say) can still be grouped as plain columns, at the cost of the
 invariances of [model §11.9](../model.md#119-invariances-and-identifiability).
 [`resolve_groups`][mtdr.data.resolve_groups] applies `MTDR`'s naming and ordering rules
