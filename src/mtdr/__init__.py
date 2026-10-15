@@ -7,8 +7,11 @@ Aoi & Pillow, NeurIPS 2018). Pre-alpha. The estimator is
 utilities are [`validate_inputs`][mtdr.data.validate_inputs],
 [`check_design`][mtdr.data.check_design],
 [`condition_average`][mtdr.data.condition_average],
-[`stack_sessions`][mtdr.data.stack_sessions] and
-[`split_trials`][mtdr.data.split_trials]; [`simulate`][mtdr.simulation.simulate]
+[`stack_sessions`][mtdr.data.stack_sessions],
+[`split_trials`][mtdr.data.split_trials], and, for regressor groups,
+[`resolve_groups`][mtdr.data.resolve_groups] and
+[`categorical_design`][mtdr.data.categorical_design];
+[`simulate`][mtdr.simulation.simulate]
 draws ground truth; `mtdr.plot` (matplotlib) and `MTDR.to_xarray` (xarray) use
 optional extras. The functional building blocks are the per-neuron sufficient
 statistics (`mtdr.stats`), the SVD fit (`mtdr.svd_fit`), the marginal
@@ -29,11 +32,14 @@ True
 from mtdr import aic, mmle, plot, rank_search, stats, svd_fit
 from mtdr._version import __version__
 from mtdr.data import (
+    CategoricalDesign,
     ConditionAverage,
     DesignReport,
     StackedSessions,
+    categorical_design,
     check_design,
     condition_average,
+    resolve_groups,
     split_trials,
     stack_sessions,
     validate_inputs,
@@ -59,6 +65,7 @@ from mtdr.svd_fit import SVDFit
 
 __all__ = [
     "MTDR",
+    "CategoricalDesign",
     "ConditionAverage",
     "ConvergenceWarning",
     "DecodingWarning",
@@ -80,11 +87,13 @@ __all__ = [
     "__version__",
     "aic",
     "canonical_factors",
+    "categorical_design",
     "check_design",
     "condition_average",
     "mmle",
     "plot",
     "rank_search",
+    "resolve_groups",
     "simulate",
     "split_trials",
     "stack_sessions",

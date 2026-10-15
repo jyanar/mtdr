@@ -2,7 +2,8 @@
 
 This page describes the fitted model, estimation, rank selection and interpretation of
 the outputs. The [technical appendices](#technical-appendices) retain the numbered
-equations **(M1)**–**(M50)** cited by the code. For validation evidence and
+equations **(M1)**–**(M50)** cited by the code; [§11](#11-regressor-groups) adds
+**(M51)**–**(M62)** for regressor groups. For validation evidence and
 implementation differences, see [Differences from MATLAB](differences-from-matlab.md).
 
 **NeurIPS supplement** and **Nature Neuroscience supplement** refer to the
@@ -524,10 +525,254 @@ See [§E.2](#e2-residual-degrees-of-freedom)
 –[§E.3](#e3-rounding-level-ends-of-the-inner-optimisers) for residual degrees of freedom
 and optimiser rounding rules.
 
+## 11. Regressor groups
+
+A **regressor group** is a set of design columns whose coefficient matrices share one
+neural basis. Use it when several columns together code one task variable, for example a
+categorical stimulus with $L$ levels coded by $L-1$ columns. As separate regressors, each
+column gets its own encoding subspace and its own rank; as a group, the variable has one
+subspace and one rank, and each column keeps its own temporal basis. Groups are passed to
+[`MTDR(groups=...)`][mtdr.model.MTDR] by name and to the functional layers
+([`mtdr.mmle`][mtdr.mmle], [`fit_svd`][mtdr.svd_fit.fit_svd],
+[`mtdr.aic`][mtdr.aic]) as column indices. Without groups every column is its own group,
+and every formula below reduces to the ungrouped one of §§2–7.
+
+### 11.1 The grouped model
+
+Partition the $P_b$ columns into groups $g$, with $g(p)$ the group of column $p$ and
+$\lvert g\rvert$ the number of columns of $g$. Then (M1) and (M4) become
+
+$$
+Y_k=\sum_gW_g\Big(\sum_{p\in g}x_{kp}S_p^\top\Big)+b^\top+E_k,\qquad
+B_p=W_{g(p)}S_p^\top,\qquad
+w_i=\big(W_{g_1}[i,:],\dots,W_{g_G}[i,:]\big)^\top\sim\mathcal N(0,I_{r_{\rm lat}}),\tag{M51}
+$$
+
+with $W_g\in\mathbb R^{n\times r_g}$, $S_p\in\mathbb R^{T\times r_g}$ for every $p\in g$,
+and $r_{\rm lat}=\sum_gr_g$. Each group has one neural basis and one rank; each column has
+its own temporal matrix. The constraint is on the $n\times\lvert g\rvert T$ concatenation,
+$\operatorname{rank}[B_p]_{p\in g}\le r_g$, so a group's rank counts neural directions
+across its columns **and** time and can exceed $T$: $r_g\le\min(n,\lvert g\rvert T)$.
+Different groups' subspaces need not be orthogonal. Groups are ordered by their smallest
+column and their columns by column index; this order fixes the blocks of $w_i$.
+
+Per neuron, the design (M8) becomes
+
+$$
+\Phi_i[\text{row block }j,\,\mathcal R_g]=\sum_{p\in g}x_{k_jp}\,S_p\in\mathbb R^{T\times r_g},
+\qquad\Phi_i=\tilde\Phi_iM,\tag{M52}
+$$
+
+with $\mathcal R_g$ group $g$'s block of the $r_{\rm lat}$ latent coordinates, and
+$\tilde\Phi_i$ the ungrouped design (M8) of the expanded components of §11.2.
+
+### 11.2 Marginal likelihood: expanded components and the tie
+
+List one component per pair (column $p$, latent coordinate $j\le r_{g(p)}$): these are
+$r_{\rm exp}=\sum_pr_{g(p)}$ components, the columns of
+$\tilde S=[S_1,\dots,S_{P_b}]\in\mathbb R^{T\times r_{\rm exp}}$, laid out exactly as the
+ungrouped bases of (M23) with $r_p=r_{g(p)}$. The 0/1 **tie matrix**
+$M\in\{0,1\}^{r_{\rm exp}\times r_{\rm lat}}$ has $M_{ca}=1$ when component $c$ belongs to
+latent coordinate $a$. With $\tilde K_i$ and $\tilde u_i$ computed by (M23) on the expanded
+list,
+
+$$
+K_i=\Phi_i^\top\Phi_i=M^\top\tilde K_iM,\quad
+K_{i,gh}=\sum_{p\in g}\sum_{q\in h}[A_i]_{pq}\,S_p^\top S_q,\qquad
+u_i=M^\top\tilde u_i,\quad
+u_{ig}=\sum_{p\in g}S_p^\top\xi_i(b)_{\langle p\rangle}.\tag{M53}
+$$
+
+The posterior $C_i=I+\lambda_iK_i$, $\mu_i=\lambda_iC_i^{-1}u_i$ of (M22), (M25) and the
+per-neuron term of (M24) are then evaluated in the $r_{\rm lat}$-dimensional latent space:
+one $r_{\rm lat}\times r_{\rm lat}$ Cholesky factorisation per neuron, with every within-
+and between-group cross term kept. A grouped evaluation costs $O(n\,r_{\rm exp}^2r_{\rm
+lat})$ for $\tilde K_i$ and the tie and $O(n\,r_{\rm lat}^3)$ for the factorisation.
+Without groups $M=I$, and the package skips the tie altogether.
+
+### 11.3 Pushforward and the basis gradient
+
+The expanded weights are $\tilde w_i=Mw_i$, so their posterior moments are
+
+$$
+\tilde\mu_i=M\mu_i,\qquad
+\tilde\Omega_i=M\Omega_iM^\top=\tilde\mu_i\tilde\mu_i^\top+MC_i^{-1}M^\top.\tag{M54}
+$$
+
+From (M24), $\partial\mathcal L_i/\partial K_i=\tfrac{\lambda_i}2\Omega_i$ (because
+$\partial\log\lvert C_i\rvert/\partial K_i=\lambda_iC_i^{-1}$ and
+$\partial(\lambda_i^2u_i^\top C_i^{-1}u_i)/\partial K_i=-\lambda_i\mu_i\mu_i^\top$) and
+$\partial\mathcal L_i/\partial u_i=-\lambda_i\mu_i$. The chain rule through (M53) gives
+$\partial\mathcal L_i/\partial\tilde K_i=\tfrac{\lambda_i}2\tilde\Omega_i$ and
+$\partial\mathcal L_i/\partial\tilde u_i=-\lambda_i\tilde\mu_i$: every downstream formula
+is the ungrouped one on the expanded list with $(\tilde\mu_i,\tilde\Omega_i)$ in place of
+$(\mu_i,\Omega_i)$. For the bases, (M26b) becomes
+
+$$
+\frac{\partial\mathcal L}{\partial S_p}=\sum_{i=1}^n\lambda_i\Big[\sum_q[A_i]_{pq}\,S_q\,
+(\Omega_i)_{[g(q)\,g(p)]}-\xi_i(b)_{\langle p\rangle}\,(\mu_i)_{[g(p)]}^\top\Big]+g\,S_p ,\tag{M55}
+$$
+
+with $(\cdot)_{[gh]}$ and $(\cdot)_{[g]}$ the latent blocks. The precision gradient (M27b)
+and the precision step (M30) keep their form, with the latent $K_i$, $u_i$, $\mu_i$ and
+$C_i^{-1}$.
+
+### 11.4 ECME basis step and intercept
+
+The multicycle basis step (M31) maximises the expected complete-data likelihood over the
+expanded components. Each $S_p$ remains a free parameter, so with the pushed-forward
+moments the step is still the exact conditional maximiser:
+
+$$
+\mathcal G\,\tilde S'^\top=\mathcal M,\qquad
+\mathcal G=\sum_{i=1}^n\lambda'_i\,\tilde A_i\circ\tilde\Omega'_i,\qquad
+\mathcal M[c,:]=\sum_{i=1}^n\lambda'_i\,(\tilde\mu'_i)_c\,\xi_i(b)_{\langle p(c)\rangle}^\top ,\tag{M56}
+$$
+
+an $r_{\rm exp}\times r_{\rm exp}$ system, $\tilde A_i$ the Gram entries of the components'
+columns and $p(c)$ the column of component $c$. Since
+$v^\top\mathcal Gv=\sum_i\lambda'_i\sum_{k\in\mathcal K_i}\mathbb E\big(\sum_cv_c\,
+x_{k\,p(c)}\,\tilde w_{ic}\big)^2$ and the posterior of $w_i$ has full support,
+$\mathcal G$ is singular only if, for some latent coordinate, the coefficients
+$(v_c)_{c\mapsto a}$ are orthogonal to the group's columns on every observed trial: some
+direction of a group's design without pooled support, which `fit`'s design checks reject.
+
+The intercept step (M33), in its centred form, applies the same tie to the moments about
+each neuron's means and pushes the result forward:
+
+$$
+b_i=\bar y_i-\sum_c\bar x_{i\,p(c)}\,\tilde S[:,c]\,(M\mu^{c}_i)_c,\qquad
+\mu^{c}_i=\lambda_i\big(I+\lambda_iM^\top\tilde K^{c}_iM\big)^{-1}M^\top\tilde u^{c}_i ,\tag{M57}
+$$
+
+with $\tilde K^c_i$ and $\tilde u^c_i$ built by (M23) from $\tilde A_i$ and $\tilde\xi_i$.
+This is the derivation of [`update_intercept`][mtdr.mmle.update_intercept] with
+$\Phi_i=\tilde\Phi_iM$: writing $x_k=\bar x_i+(x_k-\bar x_i)$ splits $\Phi_i$ into a
+centred part and $\mathbf 1\otimes\tilde\Psi_iM$, $\tilde\Psi_i=[\bar x_{ip(c)}\tilde
+S[:,c]]_c$, and Woodbury gives (M57). The refinement runs L-BFGS-B over $\tilde S$ (all
+$T\times r_{\rm exp}$ entries) with the gradient (M55). The soft directions of a grouped
+objective are $S_p\to S_pM_g$ with one $M_g$ for all of a group's columns, so
+`basis_preconditioning` stretches each group's stacked bases $[S_p]_{p\in g}$ inside
+their own span rather than each column's (stretching each column's span also stiffens
+the directions $S_pM_p$ with different $M_p$; measured, it doubled the evaluations): a
+change of variables that leaves the optimum unchanged.
+
+### 11.5 The least-squares start
+
+Per-neuron least squares (M15)-(M16) does not depend on the grouping. Each group's
+unconstrained blocks are concatenated and truncated together:
+
+$$
+[\hat B_p]_{p\in g}=U\Sigma V^\top,\qquad
+\hat W^{svd}_g=U_{:,1:r_g}\,\Sigma_{1:r_g}^{1/2},\qquad
+\hat S^{svd}_p=\big(V_{:,1:r_g}\,\Sigma_{1:r_g}^{1/2}\big)_{[p]},\tag{M58}
+$$
+
+with $(\cdot)_{[p]}$ column $p$'s block of $T$ rows: the best rank-$r_g$ approximation of
+the $n\times\lvert g\rvert T$ concatenation, with the sign rule of (M17) and, under
+`precision_weighted=True`, the row weights $D$ of (M18w) applied before the SVD. The
+intercept refit, the residual and the precisions of §3.2 are unchanged. Truncating each
+column separately, or the union of separate truncations, is not this estimator. When the
+MMLE rank search raises group $g$, its warm start appends the last component of (M58) at
+the candidate ranks to every member's $S_p$.
+
+### 11.6 Parameter counts and rank selection
+
+The SVD count (M21b) becomes the dimension of the rank-$r_g$ matrices of size
+$n\times\lvert g\rvert T$:
+
+$$
+K_{svd}(r)=\sum_gr_g\,\big(n+\lvert g\rvert T-r_g\big)+n\;\big[+\,nT\big].\tag{M59}
+$$
+
+For the marginal likelihood, group $g$'s bases enter every $\Sigma_i$ only through
+$\Phi_i\Phi_i^\top=\sum_g(X^g_i\otimes I_T)\,\tilde S_g\tilde S_g^\top\,(X^g_i\otimes
+I_T)^\top$, $\tilde S_g=[S_p]_{p\in g}\in\mathbb R^{\lvert g\rvert T\times r_g}$ stacked
+vertically: through a rank-$r_g$ positive semi-definite matrix of size $\lvert g\rvert T$,
+whose dimension is $\lvert g\rvert Tr_g-\tfrac12r_g(r_g-1)$. One rotation gauge per group
+(§11.9) gives the identifiable count, and the length of the parameter vector gives the
+count the search selects with, the analogue of (M38):
+
+$$
+K^{\rm id}_{mml}(r)=n+\sum_g\Big(\lvert g\rvert\,T\,r_g-\tfrac12r_g(r_g-1)\Big)\;\big[+\,nT\big],\qquad
+K_{mml}(r)=n+T\sum_g\lvert g\rvert\,r_g\;\big[+\,nT\big].\tag{M60}
+$$
+
+Both reduce to (M38a) and (M38) for single columns. [`MTDR`][mtdr.model.MTDR] selects
+with $K_{mml}$ and reports $K^{\rm id}_{mml}$ in `n_parameters_`, so the selection score
+exceeds `aic_` by $\sum_gr_g(r_g-1)$. Equal numerical rank across groupings is not an
+equal parameter count. Each group's rank is capped at
+$\min(n,\lvert g\rvert T,\texttt{max\_rank})$ (`max_rank=None`: the first two), and the
+greedy search (M39) raises each group up to its own cap.
+
+### 11.7 Categorical regressors
+
+With $L$ levels, one-hot indicators $D\in\{0,1\}^{N\times L}$ and a fixed basis
+$Q\in\mathbb R^{L\times(L-1)}$ with $Q^\top Q=I$ and $Q^\top\mathbf 1=0$,
+
+$$
+X_g=DQ,\qquad B_a=\sum_{p}Q_{ap}\,B_p,\qquad \sum_{a=1}^LB_a=0,\qquad
+\operatorname{rank}\big[B_1\;\cdots\;B_L\big]\le r_g .\tag{M61}
+$$
+
+$B_a$ is level $a$'s coefficient matrix and `intercept_` $+B_a$ its mean response; zero is
+the equally weighted average of the levels, neither a reference level nor the
+trial-weighted mean. Within the shared subspace each level has its own trajectory: the
+model imposes no ordering of the levels and no boundary between them, and rank 1 can still
+represent $L$ distinct values. [`categorical_design`][mtdr.data.categorical_design] builds
+the coding (orthonormal polynomials of the level indices, the normalised Helmert basis, or
+a given orthonormal zero-sum basis), its `groups` for `MTDR`, its `level_responses` (M61),
+and the candidate `rows()` for decoding the level, $Q$ itself. A level absent from every
+fitted trial makes $[\mathbf 1\ X]$ rank-deficient, which `fit` rejects.
+
+### 11.8 The canonical frame
+
+Per group, the PC orientation of §10.1 is that of the concatenation:
+
+$$
+[B_p]_{p\in g}=U\Sigma V^\top,\qquad W_g=U,\qquad S_p=(V\Sigma)_{[p]},\qquad
+R_g=\operatorname{lstsq}\big(W^{\rm raw}_g,U\big),\quad R=\operatorname{blkdiag}_g(R_g),\tag{M62}
+$$
+
+ordered by singular value with the sign rule of §10.1, and the posterior covariance maps to
+$R^\top C_i^{-1}R$. The columns of the concatenated $(V\Sigma)$ have norms $\sigma_j$; a
+single column's $S_p$ does not. For an orthonormal categorical coding,
+$[B_a]_a=[B_p]_p\,(Q^\top\otimes I_T)$ and $(Q^\top\otimes I_T)(Q^\top\otimes
+I_T)^\top=I$, so this is also the SVD of the level responses: the same $U$ and $\Sigma$.
+Likelihoods and AIC are computed in the raw frame.
+
+### 11.9 Invariances and identifiability
+
+- The marginal likelihood depends on a group's bases only through the per-trial designs
+  $\phi_{kg}(t)=\sum_{p\in g}x_{kp}\,s_p(t)$. Recoding $X_g\to X_gR$ with the bases mixed
+  by $R^{-1}$, $S'_q=\sum_p(R^{-1})_{qp}S_p$, leaves it unchanged for **any** invertible
+  $R$ at `basis_ridge=0`.
+- The least-squares start (M58), the `ridge` and the canonical frame are invariant only
+  under **orthogonal** $R$: $[\hat B_p]_p$ is then right-multiplied by the orthogonal
+  $R\otimes I_T$. The preconditioning of `basis_preconditioning=True` is not invariant
+  under any mixing within a group; it changes only the optimiser's path. So for
+  orthonormal codings converged fits agree to optimiser tolerance; other codings,
+  including a rescaled one, reach the same optimum when it is unique, but by another path.
+- A permutation $P$ of the levels of an orthonormal zero-sum $Q$ is the orthogonal recoding
+  $R=Q^\top PQ$.
+- The prior $w_{ig}\sim\mathcal N(0,I_{r_g})$ leaves the likelihood invariant to
+  $S_p\to S_pO_g$ for all $p\in g$ jointly, $O_g$ orthogonal; not to separate rotations of
+  each column, and not to rotations that mix groups. This is the one gauge per group of
+  (M60).
+
+The functional layers treat a partition into single columns exactly as `groups=None`: the
+same code path and the same numbers. A grouped `MMLEFit` or `SVDFit` records its groups,
+and [`ecme`][mtdr.mmle.ecme], [`refine`][mtdr.mmle.refine] and
+[`fit_mmle`][mtdr.mmle.fit_mmle] refuse a start fitted with other groups (pass
+`groups=init.groups`). `ecme(matlab_compat=True)` and
+`n_parameters_svd(formula="reference")` exist only for parity with the MATLAB code, which
+has no groups, and refuse a group of several columns.
+
 ## Technical appendices
 
 These appendices give the notation, derivations and numerical details behind the
-estimators; §§1–10 above cover use and interpretation.
+estimators; §§1–10 above cover use and interpretation, and §11 regressor groups with
+their derivations.
 
 ## Appendix A. Notation and statistics
 

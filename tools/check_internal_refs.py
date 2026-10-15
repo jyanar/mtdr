@@ -4,7 +4,7 @@ The package was developed against a log of design decisions, review notes and
 experiments that is kept outside the repository. Their identifiers (``D12``,
 ``H4``, ``E11``, a review's ``R3``) and paths mean nothing to a reader of the
 code, so the code, tests and docs explain themselves instead, and this check keeps
-the identifiers from coming back. Equation labels ``(M1)``-``(M50)`` are allowed:
+the identifiers from coming back. Equation labels ``(M1)``-``(M62)`` are allowed:
 they refer to ``docs/model.md``.
 
 Usage (from the repository root)::

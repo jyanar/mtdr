@@ -238,7 +238,7 @@ def _precision_problem(
     """K, u, ups and counts of the precision step at `fit` (as refine builds them)."""
     blocks = mmle._blocks(fit.S)
     xi, ups = stats.centered(fit.intercept)
-    K = mmle._expand(stats.XtX, blocks.group) * (blocks.S.T @ blocks.S)
+    K = mmle._expand(stats.XtX, blocks.column) * (blocks.S.T @ blocks.S)
     u = mmle._project(xi, blocks)
     counts = stats.n_obs.astype(np.float64) * stats.n_bins
     return K, u, ups, counts

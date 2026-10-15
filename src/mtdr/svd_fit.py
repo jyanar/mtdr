@@ -4,8 +4,10 @@ Per neuron, ordinary (or ridge) least squares of the observed responses on the
 design gives the unconstrained coefficients $\hat B_p$, (M15)-(M16); each
 $\hat B_p$ is truncated to rank $r_p$ by its singular value decomposition,
 (M17)-(M18), optionally after weighting each neuron's row by its precision,
-(M18w); the intercept is refitted given the truncated blocks; the noise
-precision of each neuron is the inverse residual variance of that fit,
+(M18w); with regressor groups, each group's blocks are concatenated,
+$[\hat B_p]_{p\in g}$, and truncated together to the group's rank (M58)
+(`docs/model.md` § 11); the intercept is refitted given the truncated blocks;
+the noise precision of each neuron is the inverse residual variance of that fit,
 computed with the **aligned** residual (M19b); and the fit is scored by the
 plug-in Gaussian log-likelihood and the textbook parameter count, (M21a)-(M21b).
 This is the reference's `SVDRegressB`, `SVDRegress_S_Vdata` and `SVDRegB_AIC`
@@ -26,15 +28,16 @@ baseline costs no accuracy.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 
+from mtdr import _groups
 from mtdr import aic as _aic
-from mtdr._args import as_bool, require_int_vector, require_non_negative_real
+from mtdr._args import as_bool, require_non_negative_real
 from mtdr._frozen import restore_frozen
 from mtdr.errors import DesignWarning, ParameterError, ValidationError
 from mtdr.stats import SufficientStats
@@ -65,7 +68,10 @@ class SVDFit:
     r"""Result of [`fit_svd`][mtdr.svd_fit.fit_svd].
 
     Per-regressor tuples are in `X` column order and exclude the intercept.
-    Arrays are read-only, also after unpickling.
+    Arrays are read-only, also after unpickling. With regressor groups
+    (`groups`, `docs/model.md` § 11), `W` and `ranks` are per group, in group
+    order, and `S`, `B` and `B_full` per column; `S[p]` has the width of its
+    group's rank. The constructor checks these widths (`ParameterError`).
 
     Attributes
     ----------
@@ -74,10 +80,13 @@ class SVDFit:
         SVD of `B_full[p]`, (M17); `(n_neurons, 0)` at rank 0. Signs are
         deterministic: the entry of largest absolute value of each column of
         $U_p$ is positive. With `precision_weighted`, $D^{-1}U_p\Sigma_p^{1/2}$
-        with $U_p$, $\Sigma_p$ from the SVD of $D\,$`B_full[p]`.
+        with $U_p$, $\Sigma_p$ from the SVD of $D\,$`B_full[p]`. With groups,
+        one `(n_neurons, r_g)` factor per group, from the SVD of the group's
+        concatenated blocks (M58).
     S : tuple of numpy.ndarray
         `(n_bins, r_p)` temporal factors $V_p\Sigma_p^{1/2}$, (M17), the
         reference's `wt{p}`; columns ordered by decreasing singular value.
+        With groups, column $p$'s block of its group's $V\Sigma^{1/2}$.
     B : tuple of numpy.ndarray
         `(n_neurons, n_bins)` rank-`r_p` coefficients `W[p] @ S[p].T`, (M18):
         the best rank-`r_p` approximation of `B_full[p]` in the Frobenius norm,
@@ -111,9 +120,12 @@ class SVDFit:
         `(n_flagged,)` int, neurons whose observed design was rank-deficient
         and which got the minimum-norm least-squares solution.
     ranks : tuple of int
-        The ranks fitted, one per regressor.
+        The ranks fitted, one per regressor (one per group with groups).
     precision_weighted : bool
         Whether `B` is the precision-weighted truncation.
+    groups : tuple of tuple of int or None
+        The regressor groups as column indices, in group order; `None` when
+        every column is its own group (the ungrouped fit).
     """
 
     W: tuple[FloatArray, ...]
@@ -129,17 +141,46 @@ class SVDFit:
     rank_deficient_neurons: IntArray
     ranks: tuple[int, ...]
     precision_weighted: bool = False
+    groups: tuple[tuple[int, ...], ...] | None = None
+
+    def __post_init__(self) -> None:
+        """Check the widths of `W` and `S` against `ranks` and `groups`."""
+        grouping = _groups.as_grouping(self.groups, len(self.S))
+        groups = (
+            _groups.Grouping.singletons(len(self.S)) if grouping is None else grouping
+        )
+        if len(self.ranks) != groups.n_groups or len(self.W) != groups.n_groups:
+            raise ParameterError(
+                f"SVDFit has {len(self.ranks)} ranks and {len(self.W)} weight "
+                f"factors for {groups.n_groups} groups of {len(self.S)} columns"
+            )
+        for p, g in enumerate(groups.group_of):
+            r = self.ranks[g]
+            if self.S[p].shape[1] != r or self.W[g].shape[1] != r:
+                raise ParameterError(
+                    f"S[{p}] must have {r} columns and W[{g}] {r} columns for rank "
+                    f"{r}; got {self.S[p].shape} and {self.W[g].shape}"
+                )
+        object.__setattr__(
+            self, "groups", None if grouping is None else grouping.groups
+        )
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        """Restore a pickled object with its arrays read-only again."""
+        """Restore a pickled object with its arrays read-only again.
+
+        A fit pickled before regressor groups existed has no `groups`: every
+        column is its own group.
+        """
+        state.setdefault("groups", None)
         restore_frozen(self, state)
 
     def __repr__(self) -> str:
         """Summarise ranks and scores instead of printing the arrays."""
         n_neurons, n_bins = self.B_full[0].shape
+        grouped = "" if self.groups is None else f", groups={self.groups}"
         return (
-            f"SVDFit(ranks={self.ranks}, n_neurons={n_neurons}, n_bins={n_bins}, "
-            f"intercept={self.intercept is not None}, "
+            f"SVDFit(ranks={self.ranks}{grouped}, n_neurons={n_neurons}, "
+            f"n_bins={n_bins}, intercept={self.intercept is not None}, "
             f"log_likelihood={self.log_likelihood:.6g}, aic={self.aic:.6g}, "
             f"rank_deficient_neurons={self.rank_deficient_neurons.size})"
         )
@@ -152,8 +193,9 @@ def fit_svd(
     ridge: float = 0.0,
     condition_independent: bool = True,
     precision_weighted: bool = False,
+    groups: Sequence[Sequence[int]] | None = None,
 ) -> SVDFit:
-    r"""Fit the SVD / reduced-rank estimator, (M15)-(M21).
+    r"""Fit the SVD / reduced-rank estimator, (M15)-(M21), (M58).
 
     1. **Least squares, (M15)-(M16).** For each neuron, with the design
        $X^f_i=[X_i\ \mathbf 1]$ of its observed trials (the column of ones only
@@ -183,7 +225,14 @@ def fit_svd(
        residual of the unconstrained fit of step 1 and $D=\mathrm{diag}(d)$,
        $D\hat B_p=U_p\Sigma_pV_p^\top$, `W[p]` $=D^{-1}U_p[:, :r_p]\Sigma_p^{1/2}$
        and `S[p]` as above: `B[p]` is the best rank-$r_p$ approximation of
-       $\hat B_p$ in the norm $\sum_id_i^2\lVert B[i,:]\rVert^2$.
+       $\hat B_p$ in the norm $\sum_id_i^2\lVert B[i,:]\rVert^2$. With
+       `groups`, (M58): each group's blocks are concatenated,
+       $[\hat B_p]_{p\in g}$ of shape $n\times\lvert g\rvert T$ (row-weighted
+       first with `precision_weighted`), and truncated to the group's rank
+       $r_g$: `W[g]` $=U_r\Sigma_r^{1/2}$ and `S[p]` the block of
+       $V_r\Sigma_r^{1/2}$ for column $p$, with the same sign rule. This is
+       the best rank-$r_g$ approximation of the concatenation, not a
+       truncation of each block.
     4. **Intercept.** Refitted given the truncated blocks,
        $\hat b_i=\frac{n_i}{n_i+\gamma}\big(\bar y_i-\sum_p\bar x_{ip}B_p[i,:]\big)$,
        the maximiser over $b$ of the plug-in likelihood at `B`, so the score
@@ -203,7 +252,8 @@ def fit_svd(
         Rank of each regressor's coefficient matrix, in `X` column order,
         `0 <= r_p <= min(n_neurons, n_bins)`. Rank 0 removes the regressor's
         term from the fitted model (its `B_full` is still estimated). The
-        intercept is not an entry.
+        intercept is not an entry. With `groups`, one rank per group in group
+        order, `0 <= r_g <= min(n_neurons, |g| n_bins)`.
     ridge : float
         $\gamma\ge0$, added to every neuron's $A^f_i$ (the reference's
         `ridgeparam`).
@@ -217,6 +267,11 @@ def fit_svd(
         weighted `B` exactly as from the unweighted one. Off by default, which
         is the reference's estimator; the weighted truncation seeds the
         marginal-likelihood rank search.
+    groups : sequence of sequence of int, optional
+        Regressor groups as column indices (`docs/model.md` § 11): a partition
+        of `range(n_regressors)`, the groups ordered by their smallest column
+        (members are sorted). `None`, or every column alone, is the ungrouped
+        fit, on the same code path.
 
     Returns
     -------
@@ -227,9 +282,11 @@ def fit_svd(
     ------
     ParameterError
         If `stats` is not a `SufficientStats`, `ranks` has the wrong length or
-        an entry outside `[0, min(n_neurons, n_bins)]` (bools and floats are
-        rejected), `ridge` is not a finite real `>= 0`, or
-        `condition_independent` or `precision_weighted` is not a bool.
+        an entry outside `[0, min(n_neurons, n_bins)]` (per group, `[0,
+        min(n_neurons, |g| n_bins)]`; bools and floats are rejected), `ridge`
+        is not a finite real `>= 0`, `condition_independent` or
+        `precision_weighted` is not a bool, or `groups` is not a partition of
+        the columns ordered by smallest column.
     ValidationError
         If a neuron was never observed, or if a neuron's residual is zero to
         rounding: $\mathrm{RSS}_i\le10^3\,\epsilon\,T\,E_i$, $E_i$ its energy
@@ -285,6 +342,13 @@ def fit_svd(
     >>> err = np.linalg.norm(fit.B[0] - sim.B["x0"]) / np.linalg.norm(sim.B["x0"])
     >>> bool(err < 0.1)
     True
+
+    One shared basis for both columns, of rank 2:
+
+    >>> grouped = fit_svd(sufficient_statistics(sim.Y, sim.X, sim.mask), [2],
+    ...                   groups=[[0, 1]])
+    >>> grouped.W[0].shape, [s.shape for s in grouped.S]
+    ((30, 2), [(10, 2), (10, 2)])
     """
     if not isinstance(stats, SufficientStats):
         raise ParameterError(
@@ -295,7 +359,8 @@ def fit_svd(
     weighted = as_bool("precision_weighted", precision_weighted)
     gamma = require_non_negative_real("ridge", ridge)
     n, P, T = stats.n_neurons, stats.n_regressors, stats.n_bins
-    rank_list = _ranks(ranks, P, min(n, T))
+    grouping = _groups.as_grouping(groups, P)
+    rank_list = _groups.require_ranks(ranks, grouping, P, n, T)
 
     never = np.flatnonzero(stats.n_obs == 0)
     if never.size:
@@ -319,14 +384,16 @@ def fit_svd(
     B_full = [np.ascontiguousarray(beta[:, p, :]) for p in range(P)]
     energy = stats.YtY_c if ci else stats.YtY_raw
     blocks = beta.transpose(1, 0, 2)  # (P, n, T)
+    truncate = _truncate if grouping is None else _grouped_truncation(grouping)
     if weighted:
         # (M18w): truncate D B_full,p and map back with D^-1.
         d = _precision_weights(stats, ci, gamma, beta, energy)
-        W, S, _ = _truncate(blocks * d[None, :, None], rank_list)
+        W, S, _ = truncate(blocks * d[None, :, None], rank_list)
         W = [np.ascontiguousarray(w / d[:, None]) for w in W]
-        B = [w @ s.T for w, s in zip(W, S, strict=True)]
+        group_of = range(P) if grouping is None else grouping.group_of
+        B = [W[g] @ s.T for g, s in zip(group_of, S, strict=True)]
     else:
-        W, S, B = _truncate(blocks, rank_list)
+        W, S, B = truncate(blocks, rank_list)
     B_arr = np.stack(B, axis=1)  # (n, P, T)
     count = stats.n_obs.astype(np.float64)
     intercept: FloatArray | None = None
@@ -343,7 +410,12 @@ def fit_svd(
         -0.5 * np.sum(n_entries * (np.log(rss / n_entries) + 1.0 + _LOG_2PI))
     )
     n_parameters = _aic.n_parameters_svd(
-        rank_list, n, T, condition_independent=ci, formula="textbook"
+        rank_list,
+        n,
+        T,
+        condition_independent=ci,
+        formula="textbook",
+        groups=None if grouping is None else grouping.groups,
     )
 
     arrays = [*W, *S, *B, *B_full, precision, deficient]
@@ -366,25 +438,11 @@ def fit_svd(
         rank_deficient_neurons=deficient,
         ranks=tuple(rank_list),
         precision_weighted=weighted,
+        groups=None if grouping is None else grouping.groups,
     )
 
 
 # --------------------------------------------------------------------------- steps
-
-
-def _ranks(ranks: object, n_regressors: int, max_rank: int) -> list[int]:
-    rank_list = require_int_vector("ranks", ranks, minimum=0)
-    if len(rank_list) != n_regressors:
-        raise ParameterError(
-            f"ranks has {len(rank_list)} entries; expected one per regressor "
-            f"({n_regressors}), without the intercept"
-        )
-    for p, r in enumerate(rank_list):
-        if r > max_rank:
-            raise ParameterError(
-                f"ranks[{p}] is {r}, above min(n_neurons, n_bins) = {max_rank}"
-            )
-    return rank_list
 
 
 def _normal_equations(
@@ -481,6 +539,41 @@ def _truncate(
         S.append(Sp)
         B.append(Wp @ Sp.T)
     return W, S, B
+
+
+def _grouped_truncation(
+    grouping: _groups.Grouping,
+) -> Callable[
+    [FloatArray, Sequence[int]],
+    tuple[list[FloatArray], list[FloatArray], list[FloatArray]],
+]:
+    """Return the truncation of (M58) for `grouping`, with `_truncate`'s outputs."""
+
+    def truncate(
+        B_full: FloatArray, ranks: Sequence[int]
+    ) -> tuple[list[FloatArray], list[FloatArray], list[FloatArray]]:
+        r"""Truncate each group's concatenated blocks $[\hat B_p]_{p\in g}$, (M58).
+
+        `W` per group, `S` and `B` per column; the sign rule of `_truncate`.
+        """
+        T = B_full.shape[2]
+        W: list[FloatArray] = []
+        S: list[FloatArray | None] = [None] * B_full.shape[0]
+        for members, r in zip(grouping.groups, ranks, strict=True):
+            joined = np.concatenate([B_full[p] for p in members], axis=1)
+            U, s, Vt = np.linalg.svd(joined, full_matrices=False)
+            lead = U[np.argmax(np.abs(U), axis=0), np.arange(U.shape[1])]
+            sign = np.where(lead < 0, -1.0, 1.0)
+            root = np.sqrt(s[:r])
+            W.append(np.ascontiguousarray(U[:, :r] * (sign[:r] * root)))
+            V = Vt[:r].T * (sign[:r] * root)  # (|g| T, r)
+            for j, p in enumerate(members):
+                S[p] = np.ascontiguousarray(V[j * T : (j + 1) * T])
+        S_out = [s for s in S if s is not None]
+        B = [W[g] @ S_out[p].T for p, g in enumerate(grouping.group_of)]
+        return W, S_out, B
+
+    return truncate
 
 
 def _residual(

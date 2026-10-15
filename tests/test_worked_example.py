@@ -41,3 +41,8 @@ def test_the_worked_example_runs_as_written() -> None:
     sim = namespace["sim"]
     assert model.ranks_ == dict(sim.ranks)  # type: ignore[attr-defined]
     assert fixed.converged_  # type: ignore[attr-defined]
+    # The categorical example: one shared basis, counted once.
+    shared = namespace["shared"]
+    assert shared.total_rank_ == 3  # type: ignore[attr-defined]
+    assert namespace["separate"].total_rank_ == 9  # type: ignore[attr-defined]
+    assert shared.converged_  # type: ignore[attr-defined]

@@ -14,7 +14,10 @@ drawn. `time` is an optional `(n_bins,)` array of bin centres for the x-axis.
 The quantities drawn are the fitted objects of the model (`docs/model.md`): the
 temporal bases $S_p$ and weights $W_p$ of (M1), the coefficient norms
 $\lVert B_p[:,t]\rVert$ of (M37), the projections (M49)-(M49a) of condition
-averages, and the AIC trace of the greedy search (M39).
+averages, and the AIC trace of the greedy search (M39). With regressor groups
+(`docs/model.md` § 11), what belongs to a column is drawn per column (`bases`,
+`coefficient_norms`) and what belongs to a shared neural basis per group
+(`weights`, `trajectories`, `rank_search`, `recovery`).
 """
 
 from __future__ import annotations
@@ -109,13 +112,17 @@ def _time(time: ArrayLike | None, n_bins: int) -> NDArray[np.float64]:
     return arr
 
 
-def _regressors(model: MTDR, regressors: object, positive: bool) -> list[str]:
+def _regressors(
+    model: MTDR, regressors: object, positive: bool, per_group: bool = False
+) -> list[str]:
+    """Return the names to draw: columns, or groups with `per_group`."""
     model._check_fitted()
-    names = list(model.regressor_names_)
+    names = list(model.group_names_ if per_group else model.regressor_names_)
+    ranks = model.ranks_ if per_group else model._column_ranks()
     if regressors is None:
         if not positive:
             return names
-        live = [n for n in names if model.ranks_[n] > 0]
+        live = [n for n in names if ranks[n] > 0]
         if not live:
             raise ParameterError(
                 "no regressor has positive rank: there are no bases or weights to draw"
@@ -128,7 +135,9 @@ def _regressors(model: MTDR, regressors: object, positive: bool) -> list[str]:
             f"{regressors!r}"
         )
     for name in entries:
-        if name not in names:
+        if per_group:
+            model._group_key(name, "regressors entry")
+        elif name not in names:
             raise ParameterError(f"unknown regressor {name!r}; names {names}")
     return [str(n) for n in entries]
 
@@ -149,14 +158,17 @@ def bases(
     frame column $j$ of $S_p$ is $\sigma_jv_j$ (its norm the singular value
     of $B_p$) and is labelled by $\sigma_j$ and its share of
     $\lVert B_p\rVert_F^2$; in the raw frame by
-    $\lVert W_p[:,j]\rVert\,\lVert S_p[:,j]\rVert$.
+    $\lVert W_p[:,j]\rVert\,\lVert S_p[:,j]\rVert$. A column of a group of
+    several columns is drawn on its own panel; in the canonical frame its
+    $S_p[:,j]$ is its block of the group's $\sigma_jv_j$, labelled by its norm
+    and its share of $\lVert B_p\rVert_F^2$ (`W_` is orthonormal there).
 
     Parameters
     ----------
     model : MTDR
         A fitted model.
     regressors : sequence of str, optional
-        Which; default every regressor of positive rank.
+        Which columns; default every regressor of positive rank.
     time : array_like, optional
         `(n_bins,)` bin centres.
     axes : Axes, array of Axes or None
@@ -179,15 +191,18 @@ def bases(
     t = _time(time, model.n_bins_)
     out = _axes(axes, len(names))
     canonical = bool(model._canonical_frame)
+    owner = model._owner()
     for ax, name in zip(out, names, strict=True):
         S = model.S_[name]
-        W = model.W_[name]
+        W = model.W_[owner[name]]
+        shared = len(model.groups_[owner[name]]) > 1
         total = float(np.sum(model.B_[name] ** 2))
         for j in range(S.shape[1]):
             if canonical:
                 sigma = float(np.linalg.norm(S[:, j]))
                 share = sigma**2 / total if total > 0 else 0.0
-                label = f"$\\sigma_{j + 1}$ = {sigma:.3g} ({share:.0%})"
+                symbol = f"\\|S[:, {j + 1}]\\|" if shared else f"\\sigma_{j + 1}"
+                label = f"${symbol}$ = {sigma:.3g} ({share:.0%})"
             else:
                 scale = float(np.linalg.norm(W[:, j]) * np.linalg.norm(S[:, j]))
                 label = f"comp. {j + 1}: |W||S| = {scale:.3g}"
@@ -212,14 +227,15 @@ def weights(
 
     A histogram (`kind="hist"`) or a bar per neuron (`"bar"`, the reference
     demo's view; useful below about 200 neurons). Answers "is the code carried
-    by a few neurons or by many" ($W_p$ of (M1)).
+    by a few neurons or by many" ($W_p$ of (M1)). With groups, one panel per
+    group: its columns share the weights.
 
     Parameters
     ----------
     model : MTDR
         A fitted model.
     regressors : sequence of str, optional
-        Which; default every regressor of positive rank.
+        Which (groups, with groups); default every one of positive rank.
     kind : {"hist", "bar"}
         The view.
     component : int
@@ -242,7 +258,7 @@ def weights(
     """
     if kind not in ("hist", "bar"):
         raise ParameterError(f"kind must be 'hist' or 'bar'; got {kind!r}")
-    names = _regressors(model, regressors, positive=True)
+    names = _regressors(model, regressors, positive=True, per_group=True)
     j = as_int(component)
     if j is None or j < 0:
         raise ParameterError(f"component must be a non-negative int; got {component!r}")
@@ -424,6 +440,7 @@ def trajectories(
     time: ArrayLike | None = None,
     cmap: str = "viridis",
     ax: object = None,
+    color_by: str | None = None,
 ) -> Axes:
     """Condition-averaged trajectories in a regressor's subspace.
 
@@ -437,7 +454,10 @@ def trajectories(
     colours are keyed by a legend with one entry per level of `regressor` (not
     per condition, when `by` spans several regressors) at up to eight levels,
     and by a colourbar ticked at the levels beyond. Conditions whose
-    projection is all `NaN` are skipped and counted in the title.
+    projection is all `NaN` are skipped and counted in the title. With
+    groups, `regressor` is a group (its shared subspace), and the colours
+    follow `color_by`, by default the group's first column (for a polynomial
+    categorical coding, the linear column, which orders the levels).
 
     Parameters
     ----------
@@ -451,7 +471,8 @@ def trajectories(
     mask : array_like, optional
         `(n_trials, n_neurons)`; `None` infers it from `NaN`, as `fit`.
     regressor : str
-        The subspace to project onto, and the colouring variable.
+        The subspace to project onto (a group, with groups), and by default
+        the colouring variable.
     by : sequence of int or str, optional
         Condition columns; default every column.
     components : (int, int), int or None
@@ -471,6 +492,9 @@ def trajectories(
         Matplotlib colormap name.
     ax : Axes or None
         Where to draw.
+    color_by : str, optional
+        The column whose condition value colours each trajectory; `None` is
+        `regressor` when it is a column, else the group's first column.
 
     Returns
     -------
@@ -480,7 +504,8 @@ def trajectories(
     Raises
     ------
     ParameterError
-        For components beyond the projected width, or as `project`.
+        For components beyond the projected width, an unknown `color_by`, or
+        as `project`.
 
     Examples
     --------
@@ -523,8 +548,14 @@ def trajectories(
             f"{regressor!r}"
         )
     t = _time(time, model.n_bins_)
-    column = list(model.regressor_names_).index(regressor)
-    values = avg.X[:, column]
+    columns = list(model.regressor_names_)
+    if color_by is None:
+        colour = regressor if regressor in columns else model.groups_[regressor][0]
+    elif color_by in columns:
+        colour = color_by
+    else:
+        raise ParameterError(f"color_by must name a column of X; got {color_by!r}")
+    values = avg.X[:, columns.index(colour)]
     span = float(values.max() - values.min())
     norm = (values - values.min()) / span if span > 0 else np.zeros_like(values)
     colours = plt.get_cmap(cmap)(norm)
@@ -545,7 +576,7 @@ def trajectories(
     if 0 < levels.size <= _MAX_LEGEND_LEVELS:
         out.legend(
             [first[float(v)] for v in levels],
-            [f"{regressor} = {v:.3g}" for v in levels],
+            [f"{colour} = {v:.3g}" for v in levels],
             fontsize="small",
         )
     elif levels.size:
@@ -557,7 +588,7 @@ def trajectories(
             cmap=plt.get_cmap(cmap),
         )
         bar = out.figure.colorbar(mappable, ax=out, ticks=levels)
-        bar.set_label(regressor)
+        bar.set_label(colour)
     if len(comps) == 2:
         out.set_xlabel(f"component {comps[0] + 1}")
         out.set_ylabel(f"component {comps[1] + 1}")
@@ -580,7 +611,10 @@ def recovery(model: MTDR, sim: SimulatedData, axes: object = None) -> AxesArray:
     precisions on log-log axes, each with the identity line and the
     correlation over all entries in its
     title ("r undefined" when either side is constant, e.g. a scalar
-    `noise_precision`): the reference demo's final figures.
+    `noise_precision`): the reference demo's final figures. With groups, one
+    scatter per group, of its concatenated coefficients $[B_p]_{p\in g}$
+    against the simulation's; the model's and the simulation's groups must
+    hold the same columns (by position).
 
     Parameters
     ----------
@@ -589,7 +623,8 @@ def recovery(model: MTDR, sim: SimulatedData, axes: object = None) -> AxesArray:
     sim : SimulatedData
         The ground truth.
     axes : array of Axes or None
-        `n_regressors + 2` panels (`+ 1` without an intercept).
+        `n_groups + 2` panels (`+ 1` without an intercept); without groups,
+        one group per regressor.
 
     Returns
     -------
@@ -623,10 +658,20 @@ def recovery(model: MTDR, sim: SimulatedData, axes: object = None) -> AxesArray:
             f"regressors, the simulation {sim.noise_precision.shape[0]}, "
             f"{sim.Y.shape[2]} and {len(sim.regressor_names)}"
         )
-    pairs: list[tuple[str, NDArray[np.float64], NDArray[np.float64], bool]] = [
-        (name, model.B_[name], sim.B[true], False)
-        for name, true in zip(names, sim.regressor_names, strict=True)
-    ]
+    true_names = list(sim.regressor_names)
+    sim_groups = sim.groups or {name: (name,) for name in true_names}
+    model_layout = [[names.index(c) for c in m] for m in model.groups_.values()]
+    sim_layout = [[true_names.index(c) for c in m] for m in sim_groups.values()]
+    if model_layout != sim_layout:
+        raise ParameterError(
+            "the model's groups hold other columns than the simulation's: "
+            f"{dict(model.groups_)} against {dict(sim_groups)}"
+        )
+    pairs: list[tuple[str, NDArray[np.float64], NDArray[np.float64], bool]] = []
+    for group, columns in zip(model.groups_, model_layout, strict=True):
+        est = np.concatenate([model.B_[names[p]] for p in columns], axis=1)
+        true = np.concatenate([sim.B[true_names[p]] for p in columns], axis=1)
+        pairs.append((group, est, true, False))
     if model.intercept_ is not None and sim.intercept is not None:
         pairs.append(("intercept", model.intercept_, sim.intercept, False))
     pairs.append(("noise precision", model.noise_precision_, sim.noise_precision, True))

@@ -40,6 +40,18 @@ only under orthogonal rotations $S_p\to S_pQ_p$ (`docs/model.md` § 10.1), so
 a canonicalised `S_` of a fitted `MTDR` is not a valid `S` argument.
 Every kernel is batched over neurons (stacks of `(n, r_tot, r_tot)`
 matrices); no loop over neurons runs outside an error path.
+
+**Regressor groups** (`groups`, `docs/model.md` § 11). The columns of a group
+$g$ share one latent weight vector $w_{ig}\in\mathbb R^{r_g}$, so
+$B_p=W_gS_p^\top$ for every $p\in g$, each column keeping its own `(T, r_g)`
+basis. The kernels run on the *expanded* components, one per (column, latent
+coordinate), exactly as for ungrouped bases, and the 0/1 tie matrix $M$ sums
+the components that share a latent coordinate, (M53): $K_i=M^\top\tilde
+K_iM$ and $u_i=M^\top\tilde u_i$. The posterior lives in the $r_{\rm lat}$
+latent coordinates; its moments are pushed forward, $\tilde\mu_i=M\mu_i$ and
+$\tilde\Omega_i=M\Omega_iM^\top$, into the unchanged basis gradient, basis
+step and intercept kernels, (M54)-(M57). `groups=None` (or every column alone)
+skips the tie: the code path, and every number, is the ungrouped one.
 """
 
 from __future__ import annotations
@@ -54,6 +66,7 @@ import scipy.linalg
 import scipy.optimize
 from numpy.typing import ArrayLike, NDArray
 
+from mtdr import _groups
 from mtdr import aic as _aic
 from mtdr._args import (
     as_bool,
@@ -184,19 +197,93 @@ _MAX_LISTED = 20
 
 
 class _Blocks(NamedTuple):
-    """The bases side by side, `[S_1, ..., S_P]`, with each component's regressor."""
+    """The bases side by side, `[S_1, ..., S_P]`, with each component's column.
 
-    S: FloatArray  # (T, r_tot)
-    group: IntArray  # (r_tot,) regressor of each component
-    bounds: tuple[int, ...]  # (P + 1,) cumulative offsets c[p]
+    With regressor groups, `latent` maps each (expanded) component to its latent
+    coordinate and `tie` is the 0/1 matrix $M$ of (M53); both are `None` for the
+    ungrouped model, whose latent coordinates are the components themselves.
+    """
+
+    S: FloatArray  # (T, r_exp) expanded components, column by column
+    column: IntArray  # (r_exp,) design column of each component
+    bounds: tuple[int, ...]  # (P + 1,) cumulative offsets c[p] of each column
+    latent: IntArray | None = None  # (r_exp,) latent coordinate of each component
+    latent_bounds: tuple[int, ...] = ()  # (G + 1,) offsets of each group's block
+    tie: FloatArray | None = None  # (r_exp, r_lat) M, M[c, latent[c]] = 1
+    grouping: _groups.Grouping | None = None
 
 
-def _blocks(S: Sequence[FloatArray]) -> _Blocks:
+def _blocks(
+    S: Sequence[FloatArray], grouping: _groups.Grouping | None = None
+) -> _Blocks:
+    """Stack the bases; with `grouping`, also the latent map and the tie (M53).
+
+    A grouping whose groups are all single columns still builds the tie (as
+    the identity), which the tests use to force the tied kernels; the public
+    functions pass `None` for it instead.
+    """
     ranks = [int(s.shape[1]) for s in S]
-    group = np.repeat(np.arange(len(S), dtype=np.int64), ranks)
+    column = np.repeat(np.arange(len(S), dtype=np.int64), ranks)
     bounds = tuple(int(c) for c in np.concatenate([[0], np.cumsum(ranks)]))
     stacked = np.concatenate([np.asarray(s, dtype=np.float64) for s in S], axis=1)
-    return _Blocks(stacked, group, bounds)
+    if grouping is None:
+        return _Blocks(stacked, column, bounds, None, bounds, None, None)
+    group_ranks = _group_widths(ranks, grouping)
+    latent_bounds = tuple(int(c) for c in np.cumsum([0, *group_ranks]))
+    latent = np.concatenate(
+        [
+            latent_bounds[g] + np.arange(ranks[p], dtype=np.int64)
+            for p, g in enumerate(grouping.group_of)
+        ]
+    ).astype(np.int64)
+    tie = np.zeros((latent.size, latent_bounds[-1]))
+    tie[np.arange(latent.size), latent] = 1.0
+    return _Blocks(stacked, column, bounds, latent, latent_bounds, tie, grouping)
+
+
+def _group_widths(widths: Sequence[int], grouping: _groups.Grouping) -> list[int]:
+    """Return each group's rank, the common width of its columns' bases."""
+    out = []
+    for g, members in enumerate(grouping.groups):
+        found = sorted({widths[p] for p in members})
+        if len(found) != 1:
+            listed = ", ".join(f"S[{p}] {widths[p]}" for p in members)
+            raise ParameterError(
+                f"the columns {list(members)} of group {g} share one latent weight, "
+                f"so their bases must have the group's rank as width; got {listed}"
+            )
+        out.append(found[0])
+    return out
+
+
+def _tie(K: FloatArray, blocks: _Blocks) -> FloatArray:
+    r"""$M^\top\tilde K_iM$ of (M53): the latent Gram, from the expanded one."""
+    if blocks.tie is None:
+        return K
+    out: FloatArray = blocks.tie.T @ K @ blocks.tie
+    return out
+
+
+def _tie_vector(u: FloatArray, blocks: _Blocks) -> FloatArray:
+    r"""$M^\top\tilde u_i$ of (M53): the latent projection, from the expanded one."""
+    if blocks.tie is None:
+        return u
+    out: FloatArray = u @ blocks.tie
+    return out
+
+
+def _push(
+    mu: FloatArray, Cinv: FloatArray, blocks: _Blocks
+) -> tuple[FloatArray, FloatArray]:
+    r"""Push the posterior forward to the components, (M54).
+
+    $\tilde\mu_i=M\mu_i$ and $MC_i^{-1}M^\top$, so that
+    $\tilde\Omega_i=\tilde\mu_i\tilde\mu_i^\top+MC_i^{-1}M^\top=M\Omega_iM^\top$.
+    """
+    if blocks.latent is None:
+        return mu, Cinv
+    lat = blocks.latent
+    return mu[:, lat], Cinv[:, lat[:, None], lat[None, :]]
 
 
 def _split(M: FloatArray, bounds: tuple[int, ...]) -> list[FloatArray]:
@@ -207,15 +294,15 @@ def _split(M: FloatArray, bounds: tuple[int, ...]) -> list[FloatArray]:
     ]
 
 
-def _expand(A: FloatArray, group: IntArray) -> FloatArray:
+def _expand(A: FloatArray, column: IntArray) -> FloatArray:
     r"""$A_i[g_j,g_k]$, the Gram entry of the regressors of components $j$ and $k$."""
-    out: FloatArray = A[:, group[:, None], group[None, :]]
+    out: FloatArray = A[:, column[:, None], column[None, :]]
     return out
 
 
 def _project(xi: FloatArray, blocks: _Blocks) -> FloatArray:
     r"""Return $u_i[k]=\sum_tS[t,k]\,\xi_i[g_k,t]$, i.e. $(u_i)_{[p]}$ of (M23)."""
-    out: FloatArray = np.einsum("ikt,tk->ik", xi[:, blocks.group, :], blocks.S)
+    out: FloatArray = np.einsum("ikt,tk->ik", xi[:, blocks.column, :], blocks.S)
     return out
 
 
@@ -307,14 +394,18 @@ def _posterior(
 
 
 class _State(NamedTuple):
-    """Everything the likelihood, its gradients and the posterior need at one point."""
+    """Everything the likelihood, its gradients and the posterior need at one point.
+
+    `Aexp` is over the expanded components; `K`, `u`, `Cinv` and `mu` are latent
+    (the same thing without groups).
+    """
 
     blocks: _Blocks
-    Aexp: FloatArray  # (n, r, r)  A_i[g_j, g_k]
-    K: FloatArray  # (n, r, r)  Phi_i' Phi_i, (M23)
-    u: FloatArray  # (n, r)     S xi_i(b), (M23)
-    Cinv: FloatArray  # (n, r, r)  C_i^{-1}, (M22)
-    mu: FloatArray  # (n, r)     posterior mean, (M25)
+    Aexp: FloatArray  # (n, r_exp, r_exp)  A_i[g_j, g_k]
+    K: FloatArray  # (n, r_lat, r_lat)  Phi_i' Phi_i, (M23), (M53)
+    u: FloatArray  # (n, r_lat)     S xi_i(b), (M23), (M53)
+    Cinv: FloatArray  # (n, r_lat, r_lat)  C_i^{-1}, (M22)
+    mu: FloatArray  # (n, r_lat)     posterior mean, (M25)
     terms: FloatArray  # (n,)       per-neuron (M24), no constant, no ridge
 
 
@@ -333,9 +424,9 @@ def _state(
     not representable in float64.
     """
     with np.errstate(over="ignore", invalid="ignore"):
-        Aexp = _expand(A, blocks.group)
-        K = Aexp * (blocks.S.T @ blocks.S)
-        u = _project(xi, blocks)
+        Aexp = _expand(A, blocks.column)
+        K = _tie(Aexp * (blocks.S.T @ blocks.S), blocks)
+        u = _tie_vector(_project(xi, blocks), blocks)
         Cinv, mu, explained, logdet = _posterior(lam, K, u)
         counts = n_obs.astype(np.float64) * T
         terms = 0.5 * (-counts * np.log(lam) + logdet + lam * ups - explained)
@@ -435,7 +526,9 @@ def _grad_bases(
     Column $k\in\mathcal R_p$ is
     $\sum_i\lambda_i\big[\sum_jS[:,j]\,A_i[g_j,g_k](\Omega_i)_{jk}
     -\xi_{i\langle p\rangle}(\mu_i)_k\big]$;
-    `xig` is $\xi_i(b)$ gathered by component, `xi[:, group, :]`.
+    `xig` is $\xi_i(b)$ gathered by component, `xi[:, column, :]`. With groups
+    the moments are the pushed-forward $\tilde\mu_i$, $MC_i^{-1}M^\top$
+    (`_push`), which gives (M55).
     """
     H = np.einsum("i,ijk->jk", lam, Aexp * _second_moment(mu, Cinv))
     E = np.einsum("i,ikt,ik->tk", lam, xig, mu)
@@ -461,6 +554,8 @@ def marginal_log_likelihood(
     intercept: ArrayLike | None,
     stats: SufficientStats,
     basis_ridge: float = 0.0,
+    *,
+    groups: Sequence[Sequence[int]] | None = None,
 ) -> float:
     r"""Marginal log-likelihood with the weights integrated out, (M22)-(M24).
 
@@ -474,6 +569,8 @@ def marginal_log_likelihood(
     $\mathcal N(\mathbf 1\otimes b_i,\ \lambda_i^{-1}I+\Phi_i\Phi_i^\top)$,
     minus the ridge when `basis_ridge` $=g>0$ (the value is then the penalised
     objective, not a log-likelihood). A neuron never observed contributes 0.
+    With `groups`, $\Phi_i$ is the grouped design of (M52), whose latent
+    weights the columns of a group share.
 
     Parameters
     ----------
@@ -488,6 +585,12 @@ def marginal_log_likelihood(
         From [`sufficient_statistics`][mtdr.stats.sufficient_statistics].
     basis_ridge : float
         $g\ge0$, the ridge on the bases.
+    groups : sequence of sequence of int, optional
+        Regressor groups as column indices (keyword-only; `docs/model.md`
+        § 11): a partition of the columns, ordered by their smallest column.
+        The columns of a group share one latent weight vector, so their bases
+        must all have the group's rank as width. `None`, or every column
+        alone, is the ungrouped model, on the same code path.
 
     Returns
     -------
@@ -500,7 +603,8 @@ def marginal_log_likelihood(
         For a `stats` that is not a `SufficientStats`; an `S` with the wrong
         number of blocks or a block that is not a finite real `(n_bins, r_p)`
         array; a `noise_precision` that is not a finite positive
-        `(n_neurons,)` array; a bad `intercept`; a negative `basis_ridge`.
+        `(n_neurons,)` array; a bad `intercept`; a negative `basis_ridge`;
+        bad `groups`, or bases of one group with different widths.
     ValidationError
         If the value is not representable in float64 at these parameters (it
         overflows), naming the neurons; never a `NaN`.
@@ -511,7 +615,9 @@ def marginal_log_likelihood(
     Notes
     -----
     Cost: $O(n\,r_{tot}^3+n\,P\,T\,r_{tot}+T\,r_{tot}^2)$ time (one batched
-    Cholesky factorisation and inverse) and $O(n\,r_{tot}^2)$ memory. The
+    Cholesky factorisation and inverse) and $O(n\,r_{tot}^2)$ memory. With
+    groups, $O(n\,r_{\rm exp}^2r_{\rm lat}+n\,r_{\rm lat}^3+n\,P\,T\,r_{\rm
+    exp})$: the expanded Gram and its tie, then a latent Cholesky. The
     explained quadratic is evaluated as $\lambda_i^2u_i^\top C_i^{-1}u_i=\lVert
     z_i\rVert^2$ with the scaled solve $z_i=L_i^{-1}(\lambda_iu_i)$,
     $C_i=L_iL_i^\top$, so that only the whitened products $\lambda_iu_i$ and
@@ -535,8 +641,18 @@ def marginal_log_likelihood(
     >>> ll = marginal_log_likelihood(S, sim.noise_precision, sim.intercept, stats)
     >>> bool(np.isfinite(ll))
     True
+
+    Both columns sharing one rank-2 weight vector:
+
+    >>> S2 = [np.ones((5, 2)), np.eye(5)[:, :2]]
+    >>> ll = marginal_log_likelihood(S2, sim.noise_precision, sim.intercept, stats,
+    ...                              groups=[[0, 1]])
+    >>> bool(np.isfinite(ll))
+    True
     """
-    stats, blocks, lam, xi, ups = _evaluation_args(S, noise_precision, intercept, stats)
+    stats, blocks, lam, xi, ups = _evaluation_args(
+        S, noise_precision, intercept, stats, groups
+    )
     g = require_non_negative_real("basis_ridge", basis_ridge)
     st = _state(blocks, lam, xi, ups, stats.XtX, stats.n_obs, stats.n_bins)
     nll = float(st.terms.sum()) + _constant(stats.n_obs, stats.n_bins)
@@ -549,6 +665,8 @@ def marginal_nll_grad_S(  # noqa: N802 - the public API name
     intercept: ArrayLike | None,
     stats: SufficientStats,
     basis_ridge: float = 0.0,
+    *,
+    groups: Sequence[Sequence[int]] | None = None,
 ) -> tuple[float, list[FloatArray]]:
     r"""Marginal NLL and its gradient with respect to the bases, (M24), (M26a)-(M26b).
 
@@ -559,7 +677,9 @@ def marginal_nll_grad_S(  # noqa: N802 - the public API name
 
     with $\mu_i$, $\Omega_i$ the posterior mean and second moment of the
     weights (M25): (M26b), the expected complete-data gradient, equal to the
-    reference's (M26a) identically.
+    reference's (M26a) identically. With `groups`, (M55): the same with
+    $(\Omega_i)_{[qp]}$ and $(\mu_i)_{[p]}$ the latent blocks of the groups of
+    $q$ and $p$.
 
     Parameters
     ----------
@@ -574,6 +694,9 @@ def marginal_nll_grad_S(  # noqa: N802 - the public API name
         The statistics.
     basis_ridge : float
         $g\ge0$, the ridge on the bases.
+    groups : sequence of sequence of int, optional
+        Regressor groups as column indices (keyword-only), as
+        `marginal_log_likelihood`.
 
     Returns
     -------
@@ -602,7 +725,9 @@ def marginal_nll_grad_S(  # noqa: N802 - the public API name
     >>> [g.shape for g in grad]
     [(5, 1), (5, 2)]
     """
-    stats, blocks, lam, xi, ups = _evaluation_args(S, noise_precision, intercept, stats)
+    stats, blocks, lam, xi, ups = _evaluation_args(
+        S, noise_precision, intercept, stats, groups
+    )
     g = require_non_negative_real("basis_ridge", basis_ridge)
     st = _state(blocks, lam, xi, ups, stats.XtX, stats.n_obs, stats.n_bins)
     value = (
@@ -610,9 +735,10 @@ def marginal_nll_grad_S(  # noqa: N802 - the public API name
         + _constant(stats.n_obs, stats.n_bins)
         + 0.5 * g * _ridge(blocks.S)
     )
-    xig = xi[:, blocks.group, :]
+    xig = xi[:, blocks.column, :]
     with np.errstate(over="ignore", invalid="ignore"):
-        grad = _grad_bases(blocks.S, st.Aexp, st.mu, st.Cinv, lam, xig) + g * blocks.S
+        mu, Cinv = _push(st.mu, st.Cinv, blocks)
+        grad = _grad_bases(blocks.S, st.Aexp, mu, Cinv, lam, xig) + g * blocks.S
     _require_finite_gradient(grad)
     return value, _split(grad, blocks.bounds)
 
@@ -622,6 +748,8 @@ def marginal_nll_grad_noise(
     noise_precision: ArrayLike,
     intercept: ArrayLike | None,
     stats: SufficientStats,
+    *,
+    groups: Sequence[Sequence[int]] | None = None,
 ) -> tuple[float, FloatArray]:
     r"""Marginal NLL and its gradient in the noise precisions, (M27a)-(M27b).
 
@@ -647,6 +775,10 @@ def marginal_nll_grad_noise(
         $b$; `None` without the intercept.
     stats : SufficientStats
         The statistics.
+    groups : sequence of sequence of int, optional
+        Regressor groups as column indices (keyword-only), as
+        `marginal_log_likelihood`; $\mathcal E_i$ is then evaluated in the latent
+        coordinates.
 
     Returns
     -------
@@ -677,7 +809,9 @@ def marginal_nll_grad_noise(
     >>> grad.shape
     (8,)
     """
-    stats, blocks, lam, xi, ups = _evaluation_args(S, noise_precision, intercept, stats)
+    stats, blocks, lam, xi, ups = _evaluation_args(
+        S, noise_precision, intercept, stats, groups
+    )
     st = _state(blocks, lam, xi, ups, stats.XtX, stats.n_obs, stats.n_bins)
     value = float(st.terms.sum()) + _constant(stats.n_obs, stats.n_bins)
     counts = stats.n_obs.astype(np.float64) * stats.n_bins
@@ -693,6 +827,8 @@ def posterior_weights(
     noise_precision: ArrayLike,
     intercept: ArrayLike | None,
     stats: SufficientStats,
+    *,
+    groups: Sequence[Sequence[int]] | None = None,
 ) -> tuple[list[FloatArray], FloatArray]:
     r"""Posterior of each neuron's stacked weight vector, (M25), (M36).
 
@@ -705,6 +841,8 @@ def posterior_weights(
     $\xi_i(b)$, as `demoLearning.m` calls it (`mTDRdemo.m:155` passes the raw
     statistic, a bug; see `docs/differences-from-matlab.md`).
     $\hat W_p[i,:]=(\mu_i)_{[p]}$, and $\hat B_p=\hat W_pS_p^\top$ is (M37).
+    With `groups`, $w_i$ is the latent weight vector, one block per group
+    (M52), and $\hat B_p=\hat W_gS_p^\top$ for each column $p$ of group $g$.
 
     Parameters
     ----------
@@ -717,15 +855,19 @@ def posterior_weights(
         $b$; `None` without the intercept.
     stats : SufficientStats
         The statistics.
+    groups : sequence of sequence of int, optional
+        Regressor groups as column indices (keyword-only), as
+        `marginal_log_likelihood`.
 
     Returns
     -------
     W_mean : list of numpy.ndarray
-        Per regressor, `(n_neurons, r_p)` posterior means.
+        Per regressor, `(n_neurons, r_p)` posterior means; with `groups`, per
+        group, `(n_neurons, r_g)`, in group order.
     W_cov : numpy.ndarray
         `(n_neurons, total_rank, total_rank)` posterior covariances
-        $C_i^{-1}$, blocks in regressor order; the identity for a neuron never
-        observed (its posterior is the prior).
+        $C_i^{-1}$, blocks in regressor order (group order with `groups`); the
+        identity for a neuron never observed (its posterior is the prior).
 
     Raises
     ------
@@ -744,13 +886,19 @@ def posterior_weights(
     >>> [w.shape for w in W], W_cov.shape
     ([(8, 1), (8, 2)], (8, 3, 3))
     """
-    stats, blocks, lam, xi, ups = _evaluation_args(S, noise_precision, intercept, stats)
+    stats, blocks, lam, xi, ups = _evaluation_args(
+        S, noise_precision, intercept, stats, groups
+    )
     st = _state(blocks, lam, xi, ups, stats.XtX, stats.n_obs, stats.n_bins)
-    return _split(st.mu, blocks.bounds), st.Cinv
+    return _split(st.mu, blocks.latent_bounds), st.Cinv
 
 
 def update_intercept(
-    S: Sequence[ArrayLike], noise_precision: ArrayLike, stats: SufficientStats
+    S: Sequence[ArrayLike],
+    noise_precision: ArrayLike,
+    stats: SufficientStats,
+    *,
+    groups: Sequence[Sequence[int]] | None = None,
 ) -> FloatArray:
     r"""Return the intercept maximising the marginal likelihood given $(S,\lambda)$.
 
@@ -792,6 +940,10 @@ def update_intercept(
         $\lambda_i>0$, as `marginal_log_likelihood`.
     stats : SufficientStats
         The statistics.
+    groups : sequence of sequence of int, optional
+        Regressor groups as column indices (keyword-only), as
+        `marginal_log_likelihood`: the same centred form with the grouped
+        design, (M57).
 
     Returns
     -------
@@ -816,7 +968,7 @@ def update_intercept(
     >>> b.shape
     (8, 5)
     """
-    stats, blocks, lam, _, _ = _evaluation_args(S, noise_precision, None, stats)
+    stats, blocks, lam, _, _ = _evaluation_args(S, noise_precision, None, stats, groups)
     _require_observed(stats)
     return _intercept_step(blocks, lam, stats)
 
@@ -860,32 +1012,41 @@ def _basis_step(st: _State, lam_new: FloatArray, xi: FloatArray) -> _Blocks:
     $\mathcal G\,\mathcal S'^\top=\mathcal M$ with
     $\mathcal G_{jk}=\sum_i\lambda'_iA_i[g_j,g_k](\Omega'_i)_{jk}$ (symmetric
     positive definite) and $\mathcal M[k,:]=\sum_i\lambda'_i(\mu'_i)_k\,
-    \xi_i(b)_{\langle g_k\rangle}^\top$.
+    \xi_i(b)_{\langle g_k\rangle}^\top$. With groups, (M56): the same system over
+    the expanded components with the pushed-forward moments $\tilde\mu'_i$,
+    $\tilde\Omega'_i$; every $S_p$ stays a free parameter, so it is the exact
+    conditional maximiser.
     """
     blocks = st.blocks
     Cinv, mu, _, _ = _posterior(lam_new, st.K, st.u)
+    mu, Cinv = _push(mu, Cinv, blocks)
     G = np.einsum("i,ijk->jk", lam_new, st.Aexp * _second_moment(mu, Cinv))
     G = 0.5 * (G + G.T)
-    M = np.einsum("i,ik,ikt->kt", lam_new, mu, xi[:, blocks.group, :])
+    M = np.einsum("i,ik,ikt->kt", lam_new, mu, xi[:, blocks.column, :])
     try:
         new = scipy.linalg.solve(G, M, assume_a="pos")
     except np.linalg.LinAlgError as err:
         # A data condition, so a ValidationError: by the Schur product theorem
-        # G is positive definite whenever every regressor has some [A_i]_pp > 0.
+        # G is positive definite whenever every regressor has some [A_i]_pp > 0;
+        # with groups, whenever every direction of each group's columns does.
         raise ValidationError(
             "the ECME basis system (M31) is not positive definite: some regressor "
-            "has no observed trial with a nonzero value"
+            "(or some direction of a group's design) has no observed trial with a "
+            "nonzero value"
         ) from err
-    return _Blocks(np.ascontiguousarray(new.T), blocks.group, blocks.bounds)
+    return blocks._replace(S=np.ascontiguousarray(new.T))
 
 
 def _intercept_step(
     blocks: _Blocks, lam: FloatArray, stats: SufficientStats
 ) -> FloatArray:
-    r"""(M33) in the centred form $b_i=\bar y_i-\Psi_i\tilde\mu_i$."""
-    Kc = _expand(stats.XtX_c, blocks.group) * (blocks.S.T @ blocks.S)
-    _, mu_c, _, _ = _posterior(lam, Kc, _project(stats.XtY_c, blocks))
-    x_mean = stats.X_mean[:, blocks.group]
+    r"""(M33) in the centred form $b_i=\bar y_i-\Psi_i\tilde\mu_i$; grouped, (M57)."""
+    Kc = _tie(_expand(stats.XtX_c, blocks.column) * (blocks.S.T @ blocks.S), blocks)
+    uc = _tie_vector(_project(stats.XtY_c, blocks), blocks)
+    _, mu_c, _, _ = _posterior(lam, Kc, uc)
+    if blocks.latent is not None:
+        mu_c = mu_c[:, blocks.latent]  # the pushforward M mu_c of (M57)
+    x_mean = stats.X_mean[:, blocks.column]
     out: FloatArray = stats.Y_mean - np.einsum("tk,ik,ik->it", blocks.S, x_mean, mu_c)
     return out
 
@@ -909,11 +1070,11 @@ def _basis_step_reference(st: _State, lam_new: FloatArray, xi: FloatArray) -> _B
     mu_hat = lam_new[:, None] * np.einsum("ijk,ik->ij", st.Cinv, st.u)
     Gi = mu_new[:, :, None] * mu_hat[:, None, :] + Cinv_new
     Gt = np.einsum("i,ijk->jk", lam_new, st.Aexp * Gi)
-    upper = blocks.group[:, None] < blocks.group[None, :]
+    upper = blocks.column[:, None] < blocks.column[None, :]
     GG = np.where(upper, Gt, Gt.T)
-    M = np.einsum("i,ik,ikt->kt", lam_new, mu_hat, xi[:, blocks.group, :])
+    M = np.einsum("i,ik,ikt->kt", lam_new, mu_hat, xi[:, blocks.column, :])
     new = np.linalg.solve(GG, M)
-    return _Blocks(np.ascontiguousarray(new.T), blocks.group, blocks.bounds)
+    return blocks._replace(S=np.ascontiguousarray(new.T))
 
 
 def _intercept_step_reference(
@@ -928,8 +1089,8 @@ def _intercept_step_reference(
     raw $\xi_i$, evaluated literally from the raw moments.
     """
     T = stats.n_bins
-    Cx = _identity_plus(lam_new, _expand(stats.XtX, new.group) * (old.S.T @ new.S))
-    Psi = new.S[None, :, :] * stats.X_mean[:, None, new.group]  # (n, T, r)
+    Cx = _identity_plus(lam_new, _expand(stats.XtX, new.column) * (old.S.T @ new.S))
+    Psi = new.S[None, :, :] * stats.X_mean[:, None, new.column]  # (n, T, r)
     CIXS = np.linalg.solve(Cx, Psi.transpose(0, 2, 1))  # (n, r, T) = C^-1 Psi'
     counts = stats.n_obs.astype(np.float64)
     bracket = np.eye(T) - (lam_new * counts)[:, None, None] * (Psi @ CIXS)
@@ -978,6 +1139,10 @@ class MMLEFit:
     value of `n_parameters` (a caller may carry another count); the validated
     entry point is [`from_parameters`][mtdr.mmle.MMLEFit.from_parameters].
 
+    With regressor groups (`groups`, `docs/model.md` § 11), `ranks`, `W` and
+    the blocks of `W_cov` are per group, in group order, while `S` and `B` stay
+    per column: `S[p]` has the rank of its group, and `B[p] = W[g] @ S[p].T`.
+
     Attributes
     ----------
     S : tuple of numpy.ndarray
@@ -987,14 +1152,14 @@ class MMLEFit:
     intercept : numpy.ndarray or None
         `(n_neurons, n_bins)` intercept $b$, or `None` without one.
     ranks : tuple of int
-        $r_p$, the widths of `S[p]` and `W[p]`.
+        $r_p$, the widths of `S[p]` and `W[p]` (with groups, $r_g$ per group).
     W : tuple of numpy.ndarray
         `(n_neurons, r_p)` posterior means of the weights at the fitted
-        parameters, (M36).
+        parameters, (M36); with groups, `(n_neurons, r_g)` per group.
     W_cov : numpy.ndarray
         `(n_neurons, total_rank, total_rank)` posterior covariances
         $C_i^{-1}$ of the stacked weight vectors, (M36); blocks in regressor
-        order.
+        order (group order with groups).
     log_likelihood : float
         Marginal log-likelihood at the fitted parameters, fully normalised,
         without the ridge.
@@ -1021,6 +1186,10 @@ class MMLEFit:
     rank_deficient_neurons : numpy.ndarray
         `(n_flagged,)` int, the neurons the SVD initializer solved by minimum
         norm; empty when the fit did not start from `fit_svd`.
+    groups : tuple of tuple of int or None
+        The regressor groups as column indices, in group order; `None` when
+        every column is its own group (the ungrouped model, whatever the
+        constructor was given).
 
     Examples
     --------
@@ -1050,11 +1219,23 @@ class MMLEFit:
     n_iter: Mapping[str, int]
     converged: bool
     rank_deficient_neurons: IntArray
+    groups: tuple[tuple[int, ...], ...] | None = None
 
     def __post_init__(self) -> None:
         """Check consistency with `ranks`; copy into read-only containers."""
         ranks = tuple(require_int_vector("ranks", self.ranks, minimum=0))
-        P = len(ranks)
+        if self.groups is None:
+            grouping = None
+            P = len(ranks)
+            group_of: Sequence[int] = range(P)
+        else:
+            grouping = _groups.check_grouping(self.groups, None)
+            P = grouping.n_columns
+            group_of = grouping.group_of
+            if len(ranks) != grouping.n_groups:
+                raise ParameterError(
+                    f"ranks has {len(ranks)} entries for {grouping.n_groups} groups"
+                )
         lam = _float_array("noise_precision", self.noise_precision, 1)
         if lam.size == 0 or not (lam > 0).all():
             raise ParameterError(
@@ -1063,12 +1244,14 @@ class MMLEFit:
         n = lam.size
         S = _array_tuple("S", self.S, P)
         T = S[0].shape[0]
-        W = _array_tuple("W", self.W, P)
-        for p, r in enumerate(ranks):
-            if S[p].shape != (T, r) or W[p].shape != (n, r):
+        W = _array_tuple("W", self.W, len(ranks), "group" if grouping else "regressor")
+        for p, g in enumerate(group_of):
+            r = ranks[g]
+            if S[p].shape != (T, r) or W[g].shape != (n, r):
+                rank = f"ranks[{p}]" if grouping is None else f"the rank of group {g}"
                 raise ParameterError(
-                    f"S[{p}] must be (n_bins, {r}) and W[{p}] ({n}, {r}) for "
-                    f"ranks[{p}] = {r}; got {S[p].shape} and {W[p].shape}"
+                    f"S[{p}] must be (n_bins, {r}) and W[{g}] ({n}, {r}) for "
+                    f"{rank} = {r}; got {S[p].shape} and {W[g].shape}"
                 )
         intercept = None
         if self.intercept is not None:
@@ -1135,21 +1318,30 @@ class MMLEFit:
             "n_iter": n_iter,
             "converged": bool(self.converged),
             "rank_deficient_neurons": deficient.astype(np.int64),
-            "_B": tuple(W[p] @ S[p].T for p in range(P)),
+            "groups": (
+                None if grouping is None or grouping.trivial else grouping.groups
+            ),
+            "_B": tuple(W[g] @ S[p].T for p, g in enumerate(group_of)),
         }
         freeze(values)
         for name, value in values.items():
             object.__setattr__(self, name, value)
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        """Restore a pickled object with its arrays read-only again."""
+        """Restore a pickled object with its arrays read-only again.
+
+        A fit pickled before regressor groups existed has no `groups`: every
+        column is its own group.
+        """
+        state.setdefault("groups", None)
         restore_frozen(self, state)
 
     @property
     def B(self) -> tuple[FloatArray, ...]:  # noqa: N802 - the model's name, (M37)
         r"""Per regressor, `(n_neurons, n_bins)` coefficients $\hat W_pS_p^\top$, (M37).
 
-        Derived once on construction, read-only; frame-independent.
+        With groups, $\hat W_gS_p^\top$ for each column $p$ of group $g$. Derived
+        once on construction, read-only; frame-independent.
         """
         out: tuple[FloatArray, ...] = self.__dict__["_B"]
         return out
@@ -1178,6 +1370,7 @@ class MMLEFit:
         intercept: ArrayLike | None,
         *,
         basis_ridge: float = 0.0,
+        groups: Sequence[Sequence[int]] | None = None,
     ) -> MMLEFit:
         r"""Build a fit at given parameters: posterior, likelihood and counts there.
 
@@ -1195,13 +1388,16 @@ class MMLEFit:
         S : sequence of array_like
             Per regressor, the `(n_bins, r_p)` bases, as
             [`marginal_log_likelihood`][mtdr.mmle.marginal_log_likelihood]; each `r_p`
-            at most `min(n_neurons, n_bins)`, as the count (M38a) requires.
+            at most `min(n_neurons, n_bins)`, as the count (M38a) requires
+            (with groups, each group's rank at most `min(n_neurons, |g| n_bins)`).
         noise_precision : array_like of shape (n_neurons,)
             $\lambda_i>0$, as `marginal_log_likelihood`.
         intercept : array_like of shape (n_neurons, n_bins), or None
             $b$; `None` without the intercept.
         basis_ridge : float
             $g\ge0$, for `objective`.
+        groups : sequence of sequence of int, optional
+            Regressor groups as column indices, as `marginal_log_likelihood`.
 
         Returns
         -------
@@ -1212,12 +1408,12 @@ class MMLEFit:
         ------
         ParameterError
             As [`marginal_log_likelihood`][mtdr.mmle.marginal_log_likelihood],
-            or for a rank above `min(n_neurons, n_bins)`.
+            or for a rank above its cap.
         ValidationError, numpy.linalg.LinAlgError
             As [`marginal_log_likelihood`][mtdr.mmle.marginal_log_likelihood].
         """
         stats, blocks, lam, xi, ups = _evaluation_args(
-            S, noise_precision, intercept, stats
+            S, noise_precision, intercept, stats, groups
         )
         g = require_non_negative_real("basis_ridge", basis_ridge)
         b = None if intercept is None else np.asarray(intercept, dtype=np.float64)
@@ -1226,8 +1422,9 @@ class MMLEFit:
 
     def __repr__(self) -> str:
         """Summarise ranks and scores instead of printing the arrays."""
+        grouped = "" if self.groups is None else f", groups={self.groups}"
         return (
-            f"MMLEFit(ranks={self.ranks}, n_neurons={self.n_neurons}, "
+            f"MMLEFit(ranks={self.ranks}{grouped}, n_neurons={self.n_neurons}, "
             f"n_bins={self.n_bins}, intercept={self.intercept is not None}, "
             f"log_likelihood={self.log_likelihood:.6g}, aic={self.aic:.6g}, "
             f"n_iter={dict(self.n_iter)}, converged={self.converged})"
@@ -1282,15 +1479,20 @@ def _assemble(
     """Build the `MMLEFit` at the point `st` was evaluated at."""
     n, T = stats.n_neurons, stats.n_bins
     bounds = st.blocks.bounds
-    ranks = tuple(bounds[p + 1] - bounds[p] for p in range(len(bounds) - 1))
+    latent = st.blocks.latent_bounds
+    ranks = tuple(latent[g + 1] - latent[g] for g in range(len(latent) - 1))
+    grouping = st.blocks.grouping
+    groups = None if grouping is None or grouping.trivial else grouping.groups
     log_likelihood = -(float(st.terms.sum()) + _constant(stats.n_obs, T))
-    k = _aic.n_parameters_mmle(ranks, n, T, condition_independent=intercept is not None)
+    k = _aic.n_parameters_mmle(
+        ranks, n, T, condition_independent=intercept is not None, groups=groups
+    )
     return MMLEFit(
         S=tuple(_split(st.blocks.S, bounds)),
         noise_precision=lam,
         intercept=intercept,
         ranks=ranks,
-        W=tuple(_split(st.mu, bounds)),
+        W=tuple(_split(st.mu, latent)),
         W_cov=st.Cinv,
         log_likelihood=log_likelihood,
         objective=log_likelihood - 0.5 * basis_ridge * _ridge(st.blocks.S),
@@ -1299,6 +1501,7 @@ def _assemble(
         n_iter=n_iter,
         converged=converged,
         rank_deficient_neurons=deficient,
+        groups=groups,
     )
 
 
@@ -1315,6 +1518,7 @@ def ecme(
     condition_independent: bool = True,
     matlab_compat: bool = False,
     verbose: int = 0,
+    groups: Sequence[Sequence[int]] | None = None,
 ) -> tuple[MMLEFit, FloatArray]:
     r"""ECME: closed-form conditional maximisation, `docs/model.md` § C.6, (M30)-(M34).
 
@@ -1337,7 +1541,8 @@ def ecme(
 
     Each step conditionally maximises the expected complete-data or the
     marginal likelihood, so the marginal NLL (M24) does not increase; the
-    returned trace shows it.
+    returned trace shows it. With `groups` the steps are (M30), (M56) and
+    (M57), in the latent coordinates of `docs/model.md` § 11.
 
     Parameters
     ----------
@@ -1346,8 +1551,8 @@ def ecme(
     init : MMLEFit
         The starting point, from
         [`MMLEFit.from_parameters`][mtdr.mmle.MMLEFit.from_parameters] or a
-        previous fit; its sizes and intercept must match `stats` and
-        `condition_independent`.
+        previous fit; its sizes, intercept and groups must match `stats`,
+        `condition_independent` and `groups`.
     max_iter : int
         Iteration cap, `>= 0`; 0 returns the starting point re-evaluated
         (`docs/model.md` § C.6: zero steps return the initial state), which is
@@ -1370,9 +1575,15 @@ def ecme(
         iterate by iterate to $10^{-12}$, with the same number of sweeps, on
         the reference run recorded in `tests/fixtures/mmle.mat`. For parity
         fixtures only: the trace is not guaranteed monotone, and an increase is
-        not reported.
+        not reported. Refused with a group of several columns (the MATLAB code
+        has no groups).
     verbose : int
         `0` silent; `1` one summary line; `2` also one line per iteration.
+    groups : sequence of sequence of int, optional
+        Regressor groups as column indices (keyword-only), as
+        [`marginal_log_likelihood`][mtdr.mmle.marginal_log_likelihood]; they
+        must be `init`'s groups (`None` means every column alone, so a grouped
+        `init` needs `groups=init.groups`).
 
     Returns
     -------
@@ -1391,8 +1602,9 @@ def ecme(
     Raises
     ------
     ParameterError
-        For bad arguments, or an `init` that is not an `MMLEFit` or does not
-        match `stats` or `condition_independent`.
+        For bad arguments, an `init` that is not an `MMLEFit` or does not
+        match `stats`, `condition_independent` or `groups`, or
+        `matlab_compat=True` with a group of several columns.
     ValidationError
         For a neuron never observed; observed once while the model has an
         intercept (`docs/model.md` § 10.3); with zero energy about its mean
@@ -1444,13 +1656,19 @@ def ecme(
     threshold = _require_positive("tol", tol)
     eps = _require_positive("convergence_eps", convergence_eps)
     level = _require_verbose(verbose)
-    _require_init(init, stats, ci)
+    grouping = _groups.as_grouping(groups, stats.n_regressors)
+    if compat and grouping is not None:
+        raise ParameterError(
+            "matlab_compat=True reproduces the MATLAB code's ECME steps, which have "
+            f"no regressor groups; groups {grouping.groups} need matlab_compat=False"
+        )
+    _require_init(init, stats, ci, grouping)
     _require_fittable(stats, ci)
 
     A, n_obs, T = stats.XtX, stats.n_obs, stats.n_bins
     const = _constant(n_obs, T)
     scale = float(n_obs.sum()) * T
-    blocks = _blocks(init.S)
+    blocks = _blocks(init.S, grouping)
     lam = np.array(init.noise_precision)
     b = None if init.intercept is None else np.array(init.intercept)
     xi, ups = stats.centered(b)
@@ -1538,6 +1756,7 @@ def refine(
     basis_span_scale: float = 1.0,
     condition_independent: bool = True,
     verbose: int = 0,
+    groups: Sequence[Sequence[int]] | None = None,
 ) -> MMLEFit:
     r"""Coordinate ascent on the marginal likelihood, `docs/model.md` § C.7.
 
@@ -1611,6 +1830,13 @@ def refine(
         Whether the model has the intercept; must match `init.intercept`.
     verbose : int
         `0` silent; `1` one summary line; `2` also one line per iteration.
+    groups : sequence of sequence of int, optional
+        Regressor groups as column indices (keyword-only), as
+        [`ecme`][mtdr.mmle.ecme]: `init`'s groups. The basis step then runs
+        over every column's basis with the gradient (M55), and
+        `basis_span_scale` stretches each group's stacked bases $[S_p]_{p\in g}$
+        inside their own span, where a grouped objective's soft directions
+        $S_p\to S_pM_g$ lie.
 
     Returns
     -------
@@ -1672,11 +1898,12 @@ def refine(
     g = require_non_negative_real("basis_ridge", basis_ridge)
     span_scale = _require_positive("basis_span_scale", basis_span_scale)
     level = _require_verbose(verbose)
-    _require_init(init, stats, ci)
+    grouping = _groups.as_grouping(groups, stats.n_regressors)
+    _require_init(init, stats, ci, grouping)
     _require_fittable(stats, ci)
 
     A, n_obs, T = stats.XtX, stats.n_obs, stats.n_bins
-    blocks = _blocks(init.S)
+    blocks = _blocks(init.S, grouping)
     lam = np.array(init.noise_precision)
     b = None if init.intercept is None else np.array(init.intercept)
     failures: list[str] = []
@@ -1905,8 +2132,10 @@ def _span_maps(
     the span of the start's $S_p$, on flattened `(T, r_tot)` arrays; $D$ is
     symmetric and $D^{-1}$ is the same with $1/\alpha$. In $y=D^{-1}s$ the
     curvature along the in-span directions $S_pM_p$ is $\alpha^2$ times larger,
-    and every other direction's is unchanged.
+    and every other direction's is unchanged. With groups, `_group_span_maps`.
     """
+    if blocks.grouping is not None:
+        return _group_span_maps(blocks, alpha)
     T, r = blocks.S.shape
     eye = np.eye(T)
     columns: list[slice] = []
@@ -1926,6 +2155,49 @@ def _span_maps(
         X = np.array(x, dtype=np.float64).reshape(T, r)
         for cols, M in zip(columns, factors, strict=True):
             X[:, cols] = M @ X[:, cols]
+        out: Float1D = X.ravel()
+        return out
+
+    return (lambda y: apply(y, up)), (lambda s: apply(s, down))
+
+
+def _group_span_maps(
+    blocks: _Blocks, alpha: float
+) -> tuple[Callable[[Float1D], Float1D], Callable[[Float1D], Float1D]]:
+    r"""`_span_maps` for groups: each group's stacked bases scaled in their span.
+
+    The soft directions of a grouped basis objective are $S_p\to S_pM_g$ with
+    one $M_g$ for every column of the group, the directions of the stacked
+    $\tilde S_g=[S_p]_{p\in g}$ (`(|g| T, r_g)`) inside its own span. So
+    $D(Y)_g=(I+(\alpha-1)\Pi_g)\,[Y_p]_{p\in g}$, $\Pi_g$ the orthogonal
+    projector onto the span of the start's $\tilde S_g$; scaling each column's
+    span separately would also stretch the stiff directions $S_pM_p$ with
+    different $M_p$. $D$ is symmetric and $D^{-1}$ is the same with $1/\alpha$.
+    """
+    T, r = blocks.S.shape
+    grouping = blocks.grouping
+    assert grouping is not None
+    units: list[list[slice]] = []
+    up: list[FloatArray] = []
+    down: list[FloatArray] = []
+    for members in grouping.groups:
+        cols = [slice(blocks.bounds[p], blocks.bounds[p + 1]) for p in members]
+        if cols[0].start == cols[0].stop:
+            continue
+        stacked = np.concatenate([blocks.S[:, c] for c in cols], axis=0)
+        Q = scipy.linalg.orth(stacked)
+        proj = Q @ Q.T
+        eye = np.eye(stacked.shape[0])
+        units.append(cols)
+        up.append(eye + (alpha - 1.0) * proj)
+        down.append(eye + (1.0 / alpha - 1.0) * proj)
+
+    def apply(x: Float1D, factors: list[FloatArray]) -> Float1D:
+        X = np.array(x, dtype=np.float64).reshape(T, r)
+        for cols, M in zip(units, factors, strict=True):
+            Z = M @ np.concatenate([X[:, c] for c in cols], axis=0)
+            for j, c in enumerate(cols):
+                X[:, c] = Z[j * T : (j + 1) * T]
         out: Float1D = X.ravel()
         return out
 
@@ -1959,21 +2231,23 @@ def _optimize_bases(
     With `span_scale` $\alpha\ne1$, L-BFGS-B runs on $y$ with $S=D(y)$
     (`_span_maps`): the objective and the acceptance are unchanged, and `tol`
     applies to the gradient in $y$, $D(\nabla_S)$. A rejected run returns the
-    start exactly.
+    start exactly. With groups the variables are every column's basis, the
+    Gram and projection are tied (M53) and the gradient is (M55).
     """
-    group, r = blocks.group, blocks.S.shape[1]
-    Aexp = _expand(A, group)
-    xig = xi[:, group, :]
+    column, r = blocks.column, blocks.S.shape[1]
+    Aexp = _expand(A, column)
+    xig = xi[:, column, :]
     counts = n_obs.astype(np.float64) * T
     fixed = 0.5 * float(np.sum(-counts * np.log(lam) + lam * ups))
 
     def objective(x: Float1D) -> tuple[float, Float1D]:
         S = x.reshape(T, r)
         with np.errstate(over="ignore", invalid="ignore"):
-            K = Aexp * (S.T @ S)
-            u = np.einsum("ikt,tk->ik", xig, S)
+            K = _tie(Aexp * (S.T @ S), blocks)
+            u = _tie_vector(np.einsum("ikt,tk->ik", xig, S), blocks)
             Cinv, mu, explained, logdet = _posterior(lam, K, u)
             value = fixed + 0.5 * float(np.sum(logdet - explained))
+            mu, Cinv = _push(mu, Cinv, blocks)
             grad = _grad_bases(S, Aexp, mu, Cinv, lam, xig)
             if g:
                 value += 0.5 * g * _ridge(S)
@@ -1996,7 +2270,7 @@ def _optimize_bases(
     S = np.ascontiguousarray(inner.x.reshape(T, r))
     message = inner.failure
     if message and inner.accepted and inner.status == 2:
-        magnitude = _basis_magnitude(S, Aexp, xig, lam, ups, counts, g)
+        magnitude = _basis_magnitude(S, Aexp, xig, lam, ups, counts, g, blocks)
         if _basis_end_is_rounding(inner, progtol, magnitude):
             message = ""  # minFunc's normal "changing by less than progTol" end
         else:
@@ -2004,7 +2278,7 @@ def _optimize_bases(
                 f"; last accepted decrease {inner.last_decrease:.3g} (rounding "
                 f"{_EPS * magnitude:.3g}, progtol {progtol:.3g})"
             )
-    return _Blocks(S, group, blocks.bounds), message
+    return blocks._replace(S=S), message
 
 
 def _basis_magnitude(
@@ -2015,17 +2289,18 @@ def _basis_magnitude(
     ups: FloatArray,
     counts: FloatArray,
     g: float,
+    blocks: _Blocks,
 ) -> float:
     r"""Return $M=\sum_i\lvert$terms$_i\rvert$ of the basis objective at `S`.
 
     The objective $\tfrac12\sum_i[-n_iT\log\lambda_i+\lambda_i\upsilon_i+\log\lvert
     C_i\rvert-\lambda_i^2u_i^\top C_i^{-1}u_i]$ (plus the ridge) sums terms of both
     signs much larger than itself, so its evaluated value carries rounding of
-    about $\epsilon M$, not $\epsilon\lvert f\rvert$.
+    about $\epsilon M$, not $\epsilon\lvert f\rvert$. `blocks` gives the tie.
     """
     with np.errstate(over="ignore", invalid="ignore"):
-        K = Aexp * (S.T @ S)
-        u = np.einsum("ikt,tk->ik", xig, S)
+        K = _tie(Aexp * (S.T @ S), blocks)
+        u = _tie_vector(np.einsum("ikt,tk->ik", xig, S), blocks)
         _, _, explained, logdet = _posterior(lam, K, u)
         terms = counts * np.abs(np.log(lam)) + lam * ups + np.abs(logdet) + explained
         out = 0.5 * float(np.sum(terms))
@@ -2087,10 +2362,11 @@ def _optimize_precision(
     as success if every scale-free residual
     $\lvert\lambda_i\mathcal E_i/(n_iT)-1\rvert$ at the installed point is at
     most `PRECISION_RESIDUAL_TOL`. Status-0 and status-1 ends are not
-    polished, so a converged step is unchanged.
+    polished, so a converged step is unchanged. With groups, `K` and `u` are
+    the latent ones (M53).
     """
-    K = _expand(A, blocks.group) * (blocks.S.T @ blocks.S)
-    u = _project(xi, blocks)
+    K = _tie(_expand(A, blocks.column) * (blocks.S.T @ blocks.S), blocks)
+    u = _tie_vector(_project(xi, blocks), blocks)
     counts = n_obs.astype(np.float64) * T
 
     def objective(theta: Float1D) -> tuple[float, Float1D]:
@@ -2253,6 +2529,7 @@ def fit_mmle(
     basis_ridge: float = 0.0,
     basis_span_scale: float = 1.0,
     verbose: int = 0,
+    groups: Sequence[Sequence[int]] | None = None,
 ) -> MMLEFit:
     r"""Fit the marginal-likelihood estimator at fixed ranks, `docs/model.md` § 5.
 
@@ -2262,22 +2539,23 @@ def fit_mmle(
        ranks (the intercept handled inside it as a full-rank regressor), then
        $S^{(0)}_p=\hat S^{svd}_p$, $\lambda^{(0)}=\hat\lambda^{svd}$ and
        $b^{(0)}_i=\bar y_i$ (the SVD's own intercept is discarded, as in the
-       reference).
+       reference). With `groups`, the grouped SVD start (M58).
     2. [`ecme`][mtdr.mmle.ecme] to the loose tolerance `ecme_tol`.
     3. [`refine`][mtdr.mmle.refine] to `refine_tol`.
     4. The posterior of the weights (M36) and the scores at the result, with
-       the identifiable count (M38a).
+       the identifiable count (M38a), (M60) with groups.
 
     Parameters
     ----------
     stats : SufficientStats
         The statistics.
     ranks : sequence of int or 1-D integer array
-        $r_p$ per regressor, `0 <= r_p <= min(n_neurons, n_bins)`.
+        $r_p$ per regressor, `0 <= r_p <= min(n_neurons, n_bins)`; with
+        `groups`, one $r_g$ per group, `0 <= r_g <= min(n_neurons, |g| n_bins)`.
     init : MMLEFit, SVDFit or None
         `None` runs `fit_svd` (with `ridge`); an `SVDFit` is used as step 1's
         initializer; an `MMLEFit` skips step 1 and starts ECME from it. Its
-        ranks must equal `ranks` and its intercept match
+        groups and ranks must equal `groups` and `ranks` and its intercept match
         `condition_independent`.
     condition_independent : bool
         Fit the intercept.
@@ -2310,6 +2588,11 @@ def fit_mmle(
         See [`refine`][mtdr.mmle.refine].
     verbose : int
         `0`, `1` or `2`, passed to `ecme` and `refine`.
+    groups : sequence of sequence of int, optional
+        Regressor groups as column indices (keyword-only; `docs/model.md`
+        § 11): a partition of the columns ordered by their smallest column,
+        whose columns share one latent weight vector each. `None`, or every
+        column alone, is the ungrouped fit, on the same code path.
 
     Returns
     -------
@@ -2322,7 +2605,8 @@ def fit_mmle(
     Raises
     ------
     ParameterError
-        For bad arguments or ranks, or an `init` that does not match.
+        For bad arguments, groups or ranks, or an `init` that does not match
+        (its groups included).
     ValidationError, numpy.linalg.LinAlgError
         As [`fit_svd`][mtdr.svd_fit.fit_svd] and [`ecme`][mtdr.mmle.ecme].
 
@@ -2352,40 +2636,51 @@ def fit_mmle(
     >>> err = np.linalg.norm(fit.B[0] - sim.B["x0"]) / np.linalg.norm(sim.B["x0"])
     >>> bool(err < 0.1), fit.converged
     (True, True)
+
+    The same columns with one shared neural basis of rank 2:
+
+    >>> shared = fit_mmle(stats, [2], groups=[[0, 1]])
+    >>> shared.W[0].shape, [s.shape for s in shared.S], shared.total_rank
+    ((30, 2), [(10, 2), (10, 2)], 2)
     """
     stats = _require_stats(stats)
     ci = as_bool("condition_independent", condition_independent)
     n, T = stats.n_neurons, stats.n_bins
-    rank_list = require_int_vector("ranks", ranks, minimum=0)
-    if len(rank_list) != stats.n_regressors:
-        raise ParameterError(
-            f"ranks has {len(rank_list)} entries; expected one per regressor "
-            f"({stats.n_regressors}), without the intercept"
-        )
-    for p, r in enumerate(rank_list):
-        if r > min(n, T):
-            raise ParameterError(
-                f"ranks[{p}] is {r}, above min(n_neurons, n_bins) = {min(n, T)}"
-            )
+    grouping = _groups.as_grouping(groups, stats.n_regressors)
+    rank_list = _groups.require_ranks(ranks, grouping, stats.n_regressors, n, T)
+    group_arg = None if grouping is None else grouping.groups
     common: dict[str, Any] = {
         "convergence_eps": convergence_eps,
         "condition_independent": ci,
         "verbose": verbose,
     }
+    if grouping is not None:
+        common["groups"] = group_arg
     # Before the SVD start, so that an unfittable neuron is not first reported
     # as rank-deficient.
     _require_fittable(stats, ci)
     if init is None or isinstance(init, SVDFit):
         if init is None:
-            svd = fit_svd(stats, rank_list, ridge=ridge, condition_independent=ci)
+            svd = fit_svd(
+                stats,
+                rank_list,
+                ridge=ridge,
+                condition_independent=ci,
+                groups=group_arg,
+            )
         else:
-            _require_svd_init(init, stats, rank_list, ci)
+            _require_svd_init(init, stats, rank_list, ci, grouping)
             svd = init
         start = MMLEFit.from_parameters(
-            stats, svd.S, svd.noise_precision, stats.Y_mean if ci else None
+            stats,
+            svd.S,
+            svd.noise_precision,
+            stats.Y_mean if ci else None,
+            groups=group_arg,
         )
         start = _with_deficient(start, svd.rank_deficient_neurons)
     elif isinstance(init, MMLEFit):
+        _require_same_groups(init.groups, grouping)
         if list(init.ranks) != rank_list:
             raise ParameterError(
                 f"init has ranks {init.ranks}; expected {tuple(rank_list)}"
@@ -2430,14 +2725,23 @@ def _require_stats(stats: object) -> SufficientStats:
 
 
 def _evaluation_args(
-    S: object, noise_precision: object, intercept: object, stats: object
+    S: object,
+    noise_precision: object,
+    intercept: object,
+    stats: object,
+    groups: object = None,
 ) -> tuple[SufficientStats, _Blocks, FloatArray, FloatArray, FloatArray]:
-    """Validate the evaluators' arguments: stats, bases, precisions, centred stats."""
+    """Validate the evaluators' arguments: stats, bases, precisions, centred stats.
+
+    `groups` (column indices) is checked against the columns, and the bases of
+    a group against each other's widths.
+    """
     stats = _require_stats(stats)
+    grouping = _groups.as_grouping(groups, stats.n_regressors)
     bases = _require_bases(S, stats.n_regressors, stats.n_bins)
     lam = _require_precision(noise_precision, stats.n_neurons)
     xi, ups = stats.centered(intercept)  # type: ignore[arg-type]
-    return stats, _blocks(bases), lam, xi, ups
+    return stats, _blocks(bases, grouping), lam, xi, ups
 
 
 def _require_bases(value: object, n_regressors: int, n_bins: int) -> list[FloatArray]:
@@ -2504,33 +2808,57 @@ def _require_verbose(value: object) -> int:
     return level
 
 
-def _require_init(init: object, stats: SufficientStats, ci: bool) -> None:
+def _require_init(
+    init: object,
+    stats: SufficientStats,
+    ci: bool,
+    grouping: _groups.Grouping | None = None,
+) -> None:
     if not isinstance(init, MMLEFit):
         raise ParameterError(
             "init must be an MMLEFit (see MMLEFit.from_parameters); got "
             f"{type(init).__name__}"
         )
-    if (init.n_neurons, init.n_bins, len(init.ranks)) != (
+    if (init.n_neurons, init.n_bins, len(init.S)) != (
         stats.n_neurons,
         stats.n_bins,
         stats.n_regressors,
     ):
         raise ParameterError(
             f"init has {init.n_neurons} neurons, {init.n_bins} bins and "
-            f"{len(init.ranks)} regressors; stats has {stats.n_neurons}, "
+            f"{len(init.S)} regressors; stats has {stats.n_neurons}, "
             f"{stats.n_bins} and {stats.n_regressors}"
         )
+    _require_same_groups(init.groups, grouping)
     if (init.intercept is not None) != ci:
         has = "has an" if init.intercept is not None else "has no"
         raise ParameterError(f"condition_independent={ci}, but init {has} intercept")
 
 
-def _require_svd_init(
-    svd: SVDFit, stats: SufficientStats, ranks: list[int], ci: bool
+def _require_same_groups(
+    fitted: tuple[tuple[int, ...], ...] | None, grouping: _groups.Grouping | None
 ) -> None:
-    sizes = (*svd.B_full[0].shape, len(svd.ranks))
+    """Raise unless an `init`'s groups are the requested ones."""
+    wanted = None if grouping is None else grouping.groups
+    if fitted != wanted:
+        raise ParameterError(
+            f"init was fitted with groups {fitted} (None: every column alone), but "
+            f"groups is {wanted}; pass the groups of init (groups=init.groups) or "
+            "start from a fit with these groups"
+        )
+
+
+def _require_svd_init(
+    svd: SVDFit,
+    stats: SufficientStats,
+    ranks: list[int],
+    ci: bool,
+    grouping: _groups.Grouping | None = None,
+) -> None:
+    sizes = (*svd.B_full[0].shape, len(svd.S))
     if sizes != (stats.n_neurons, stats.n_bins, stats.n_regressors):
         raise ParameterError("init (an SVDFit) does not match the sizes of stats")
+    _require_same_groups(svd.groups, grouping)
     if list(svd.ranks) != ranks:
         raise ParameterError(f"init has ranks {svd.ranks}; expected {tuple(ranks)}")
     if (svd.intercept is not None) != ci:
@@ -2617,11 +2945,13 @@ def _float_array(name: str, value: object, ndim: int) -> FloatArray:
     return out
 
 
-def _array_tuple(name: str, value: object, length: int) -> tuple[FloatArray, ...]:
+def _array_tuple(
+    name: str, value: object, length: int, what: str = "regressor"
+) -> tuple[FloatArray, ...]:
     entries = as_list(value)
     if entries is None or len(entries) != length:
         raise ParameterError(
-            f"{name} must be a sequence of {length} 2-D arrays, one per regressor"
+            f"{name} must be a sequence of {length} 2-D arrays, one per {what}"
         )
     return tuple(_float_array(f"{name}[{p}]", e, 2) for p, e in enumerate(entries))
 

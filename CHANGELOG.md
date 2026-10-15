@@ -4,6 +4,43 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Regressor groups: `MTDR(groups={"sa": ["sa_1", "sa_2", "sa_3", "sa_4"]})` makes the
+  listed columns share one neural basis `W_[g]` and one rank, each column keeping its own
+  temporal basis `S_[p]` ($B_p=W_gS_p^\top$). New fitted attributes `groups_` and
+  `group_names_`; `ranks_`, `W_`, the posterior-covariance blocks and the rank-search
+  names are per group, `S_` and `B_` per column. Every method supports groups:
+  `project`, `orthogonalize`, `subspace_angles` and `explained_variance` by group;
+  `decode` enumerates a group's candidate rows as one discrete unit; `to_xarray` adds a
+  `group` dimension; the plots draw per group or per column as appropriate. The grouped
+  rank search caps each group at `min(n_neurons, |g| n_bins, max_rank)` and works with
+  warm starts and `n_jobs`. The model, its derivations (the tie of the expanded
+  components, the pushed-forward posterior, the grouped SVD start) and the grouped
+  parameter counts are section 11 of "The model and its estimation".
+- `groups=` (column indices) in the functional layers: `mtdr.mmle` (the likelihood, its
+  gradients, the posterior, the intercept, `ecme`, `refine`, `fit_mmle`,
+  `MMLEFit.from_parameters`), `fit_svd` and the counts of `mtdr.aic`; `MMLEFit` and
+  `SVDFit` record their `groups`. `ecme(matlab_compat=True)` and
+  `n_parameters_svd(formula="reference")` refuse a group of several columns.
+- `mtdr.resolve_groups`, the rules and order of `MTDR(groups=...)`, and
+  `mtdr.categorical_design` / `CategoricalDesign`: a categorical regressor as one group of
+  orthonormal zero-sum columns (polynomial, Helmert, or a given basis), with `encode`,
+  `rows`, `labels_from_rows` and `level_responses`.
+- `simulate(groups=...)`: one weight draw per group and one basis per column;
+  `SimulatedData.groups`.
+- `greedy_aic(max_rank=...)` accepts one cap per regressor.
+
+### Changed
+
+- The `ValidationError` for a rank-deficient pooled design names a categorical level
+  absent from the fitted trials as one cause.
+
+Without `groups` every number is unchanged, bit for bit. Models, fits and simulations
+pickled by 0.1.0 load as ungrouped ones.
+
 ## [0.1.0] - 2026-10-08
 
 First public release: a Python port of the MATLAB mTDR demo

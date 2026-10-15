@@ -411,7 +411,7 @@ def test_basis_step_solves_its_normal_equations() -> None:
     lam1 = mmle._precision_step(st, ups, pr.stats.n_obs, pr.stats.n_bins)
     new = mmle._basis_step(st, lam1, xi)
     Cinv, mu, _, _ = mmle._posterior(lam1, st.K, st.u)
-    xig = xi[:, new.group, :]
+    xig = xi[:, new.column, :]
     grad = mmle._grad_bases(new.S, st.Aexp, mu, Cinv, lam1, xig)
     scale = np.abs(mmle._grad_bases(st.blocks.S, st.Aexp, mu, Cinv, lam1, xig)).max()
     assert np.abs(grad).max() < 1e-10 * scale

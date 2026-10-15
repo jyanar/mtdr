@@ -144,6 +144,7 @@ def test_defaults_match_the_api() -> None:
         "verbose": 0,
         "n_jobs": None,
         "basis_preconditioning": False,
+        "groups": None,
     }
     assert repr(MTDR()) == "MTDR()"
     assert repr(MTDR(ranks=[1, 2], ridge=0.5, canonicalize=False)) == (

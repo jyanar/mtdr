@@ -14,7 +14,10 @@ $$
 (M1)-(M4), under the observation mask (M3), and derives from the fit the
 projections (M49)-(M49a), the plug-in decoder (M46)-(M48c) and the held-out
 plug-in likelihood. Per-regressor results are dicts keyed by regressor name, in
-`X` column order.
+`X` column order. With regressor groups (`groups`, `docs/model.md` § 11),
+whatever belongs to a latent weight (`W_`, `ranks_`, projections, subspace
+angles) is keyed by group and whatever belongs to a design column (`S_`, `B_`,
+decoded values) by column.
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ import numpy as np
 import scipy.linalg
 from numpy.typing import ArrayLike, NDArray
 
+from mtdr import _groups
 from mtdr import aic as _aic
 from mtdr._args import (
     as_int,
@@ -55,10 +59,12 @@ from mtdr._args import (
 from mtdr.data import (
     _as_array,
     _deficient_message,
+    _group_spec,
     _observation_floor,
     _soft_warnings,
     _uncentred_message,
     _validated,
+    resolve_groups,
     validate_inputs,
 )
 from mtdr.errors import (
@@ -100,6 +106,8 @@ _REASON_CHARS = 200
 _FITTED = frozenset(
     {
         "regressor_names_",
+        "groups_",
+        "group_names_",
         "n_trials_",
         "n_neurons_",
         "n_bins_",
@@ -137,7 +145,10 @@ class MTDR:
     maximises the marginal likelihood (M24) by ECME and coordinate ascent
     (`docs/model.md` § 5), then sets `W_` to the posterior mean (M36);
     `estimator="svd"` is reduced-rank regression, (M15)-(M18). `ranks="aic"`
-    chooses the ranks by the greedy AIC search (M39).
+    chooses the ranks by the greedy AIC search (M39). With `groups`, the
+    columns of a group share one neural basis and one rank, $B_p=W_gS_p^\top$
+    for every column $p$ of group $g$, each column keeping its own temporal
+    basis (`docs/model.md` § 11).
 
     The constructor only stores and checks hyper-parameters (sklearn style);
     [`fit`][mtdr.model.MTDR.fit] learns, and fitted attributes end in `_`.
@@ -148,7 +159,9 @@ class MTDR:
     ranks : "aic", sequence of int or mapping of str to int
         `"aic"` chooses every rank by AIC (positive ranks only); a sequence
         (one per column of `X`) or a mapping naming every regressor fixes them;
-        `0` removes a regressor's term.
+        `0` removes a regressor's term. With `groups`, `"aic"` or a mapping
+        naming every group (columns that no group lists are groups of their
+        own), each rank at most `min(n_neurons, |g| n_bins, max_rank)`.
     estimator : {"mmle", "svd"}
         The marginal-likelihood estimator (default) or reduced-rank regression.
     condition_independent : bool
@@ -156,7 +169,10 @@ class MTDR:
         mean-subtracted per neuron and bin.
     max_rank : int, optional
         Largest rank the search may assign (and a bound on fixed ranks);
-        `None` is `min(n_neurons, n_bins)`.
+        `None` is `min(n_neurons, n_bins)`. With `groups`, each group's cap is
+        `min(n_neurons, |g| n_bins, max_rank)` (`None`: without the last), and
+        `max_rank` may not exceed the largest group's `min(n_neurons, |g|
+        n_bins)`.
     min_observations : int
         A neuron observed on fewer trials is a `ValidationError` in `fit`;
         under `"mmle"` the floor applied is at least `n_regressors + 2`
@@ -166,13 +182,14 @@ class MTDR:
         L2 penalty on every neuron's $X_i^\top X_i$ in the least-squares stage.
     basis_ridge : float
         L2 penalty $\tfrac g2\lVert S\rVert^2$ on the bases (`"mmle"` only).
-    rank_search_init : {"svd_weighted", "svd", "ones"} or sequence of int
+    rank_search_init : {"svd_weighted", "svd", "ones"}, sequence or mapping of int
         Where the search starts: `"svd_weighted"` runs the AIC search of the
         precision-weighted SVD fit (M18w) from ones and starts the MMLE search
         at its ranks; `"svd"` the same with the unweighted fit, as the
         reference does; `"ones"` a single MMLE search from ones; a sequence of
-        positive ints starts there. With `estimator="svd"` the strings
-        coincide (one unweighted SVD search from ones).
+        positive ints, or a mapping naming every regressor, starts there. With
+        `estimator="svd"` the strings coincide (one unweighted SVD search from
+        ones). With `groups`, a string or a mapping naming every group.
     rank_search_threshold : float
         $\delta\ge0$: a step is accepted only if it lowers the AIC by more.
     rank_search_warm_start : bool
@@ -258,13 +275,34 @@ class MTDR:
         fewer basis-step evaluations and a whole search runs 1.3-1.8x faster
         with the same ranks. Because the path differs, results differ from
         `False`'s at the optimiser's tolerance, and `optimizer_tol` is then
-        tested on the rescaled gradient. Off by default. No effect with
+        tested on the rescaled gradient. With `groups`, each group's stacked
+        bases are stretched inside their joint span (at 300 neurons, 30 bins
+        and 2000 trials, one group of four columns at rank 4: 1.4-2.4x fewer
+        basis-step evaluations). Off by default. No effect with
         `estimator="svd"`.
+    groups : mapping of str to sequence of str, optional
+        Regressor groups (`docs/model.md` § 11): group name to member columns
+        (names of `regressor_names`). The columns of a group share one neural
+        basis `W_[g]` and one rank; each keeps its own temporal basis
+        `S_[p]`. Columns not listed are groups of their own, named after
+        themselves; a group may be named after one of its own columns, never
+        after another column. [`resolve_groups`][mtdr.data.resolve_groups]
+        gives the resulting groups and their order (by smallest member
+        column). `None` (the default) makes every column its own group, the
+        ungrouped model, on the same code path and with the same numbers. With
+        a mapping, `ranks` and `rank_search_init` must be mappings of group
+        names (or strings), not sequences.
 
     Attributes
     ----------
     regressor_names_ : tuple of str
         Names in `X` column order; the keys of every per-regressor dict.
+    groups_ : dict of str to tuple of str
+        Every group, in group order (by smallest member column), with its
+        member columns; each column alone without `groups`.
+    group_names_ : tuple of str
+        The group names in group order: the keys of `ranks_` and `W_` and the
+        names of `rank_search_history_`. Without `groups`, `regressor_names_`.
     n_trials_ : int
         Trials seen in `fit`.
     n_neurons_ : int
@@ -277,21 +315,26 @@ class MTDR:
         `(n_neurons,)` int, the trials on which each neuron was observed (the
         mask's column sums).
     ranks_ : dict of str to int
-        The rank $r_p$ of every regressor, chosen or fixed.
+        The rank $r_p$ of every regressor, chosen or fixed; with groups, of
+        every group.
     total_rank_ : int
-        $\sum_pr_p$.
+        $\sum_pr_p$; with groups $\sum_gr_g$, each shared basis counted once.
     W_ : dict of str to numpy.ndarray
         `(n_neurons, r_p)` neuron weights. With `canonicalize=True` the
         orthonormal encoding-subspace basis $U_p$; otherwise the
         posterior mean (M36) in the estimator's frame (`"mmle"`) or the left
-        factor of (M17) (`"svd"`). `(n_neurons, 0)` at rank 0.
+        factor of (M17) (`"svd"`). `(n_neurons, 0)` at rank 0. With groups,
+        keyed by group, `(n_neurons, r_g)`: the canonical $U_g$ is that of the
+        group's concatenated coefficients $[B_p]_{p\in g}$.
     S_ : dict of str to numpy.ndarray
         `(n_bins, r_p)` temporal bases. With `canonicalize=True`,
         $V_p\Sigma_p$: column $j$ has norm $\sigma_j$, the $j$-th singular
-        value of $B_p$. A display frame: never pass it to `mtdr.mmle`.
+        value of $B_p$. A display frame: never pass it to `mtdr.mmle`. With
+        groups, still keyed by column, `(n_bins, r_g)` for a column of group
+        $g$: its block of the group's $V\Sigma$.
     B_ : dict of str to numpy.ndarray
         `(n_neurons, n_bins)` coefficient matrices $B_p=W_pS_p^\top$ (M1);
-        frame-independent.
+        frame-independent. Keyed by column; with groups $B_p=W_gS_p^\top$.
     intercept_ : numpy.ndarray or None
         `(n_neurons, n_bins)` condition-independent term; `None` with
         `condition_independent=False`.
@@ -300,8 +343,8 @@ class MTDR:
     weight_posterior_cov_ : numpy.ndarray or None
         `"mmle"`: `(n_neurons, total_rank_, total_rank_)`, the posterior
         covariance $C_i^{-1}$ of neuron $i$'s stacked weights (M25), (M36), in
-        the frame of `W_` (`R.T @ Cov @ R` in the canonical frame).
-        `None` for `"svd"`.
+        the frame of `W_` (`R.T @ Cov @ R` in the canonical frame); blocks in
+        group order. `None` for `"svd"`.
     log_likelihood_ : float
         The training log-likelihood at the fit, fully normalised, in the
         raw frame. Under `"mmle"` it is the **marginal** likelihood (M24),
@@ -315,15 +358,18 @@ class MTDR:
         What the fit maximised: `log_likelihood_` less
         $\tfrac g2\sum_p\lVert S_p\rVert_F^2$ (`basis_ridge` $=g$).
     n_parameters_ : int
-        The count in `aic_`: (M38a) for `"mmle"`, (M21b) for `"svd"`.
+        The count in `aic_`: (M38a) for `"mmle"`, (M21b) for `"svd"`; with
+        groups (M60) and (M59).
     aic_ : float
         `2 * n_parameters_ - 2 * log_likelihood_`. Under `"mmle"` the rank
         search selects with the reference count (M38) instead, so
         `rank_search_history_.aic` holds scores that exceed `aic_` by
-        $\sum_pr_p(r_p-1)$ at the same ranks.
+        $\sum_pr_p(r_p-1)$ at the same ranks (by $\sum_gr_g(r_g-1)$ with
+        groups).
     rank_search_history_ : RankSearchHistory or None
         The record of the greedy AIC search (M39); `None` when the ranks were
-        fixed.
+        fixed. With groups its `regressor_names` are the group names and its
+        rank vectors are per group.
     estimator_ : str
         The estimator that produced the parameters, `"mmle"` or `"svd"`.
     converged_ : bool
@@ -362,6 +408,18 @@ class MTDR:
     ({'stim': 2, 'choice': 1}, (40, 2), (40, 8))
     >>> MTDR(ranks="aic", estimator="svd", max_rank=4)
     MTDR(estimator='svd', max_rank=4)
+
+    Two columns with one shared neural basis of rank 2:
+
+    >>> groups = {"stim": ["s1", "s2"]}
+    >>> sim = simulate(n_neurons=40, n_bins=8, n_trials=200, ranks={"stim": 2},
+    ...                regressor_names=["s1", "s2"], groups=groups, seed=0)
+    >>> shared = MTDR(ranks={"stim": 2}, groups=groups).fit(
+    ...     sim.Y, sim.X, regressor_names=["s1", "s2"])
+    >>> shared.groups_, shared.W_["stim"].shape, shared.S_["s2"].shape
+    ({'stim': ('s1', 's2')}, (40, 2), (8, 2))
+    >>> shared.total_rank_, shared.converged_
+    (2, True)
     """
 
     def __init__(
@@ -374,7 +432,8 @@ class MTDR:
         ridge: float = 0.0,
         basis_ridge: float = 0.0,
         rank_search_init: Literal["svd_weighted", "svd", "ones"]
-        | Sequence[int] = "svd_weighted",
+        | Sequence[int]
+        | Mapping[str, int] = "svd_weighted",
         rank_search_threshold: float = 0.0,
         rank_search_warm_start: bool = True,
         ecme_max_iter: int = 100,
@@ -389,6 +448,7 @@ class MTDR:
         verbose: int = 0,
         n_jobs: int | None = None,
         basis_preconditioning: bool = False,
+        groups: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self.ranks = ranks
         self.estimator = estimator
@@ -412,6 +472,7 @@ class MTDR:
         self.verbose = verbose
         self.n_jobs = n_jobs
         self.basis_preconditioning = basis_preconditioning
+        self.groups = groups
         self._params()
 
     # ------------------------------------------------------------------ sklearn
@@ -505,9 +566,25 @@ class MTDR:
             f"{type(self).__name__!r} object has no attribute {name!r}"
         )
 
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore a pickled model, also one pickled before regressor groups existed.
+
+        Such a model has no `groups` (it is `None`) and, fitted, no `groups_`
+        or `group_names_`: every column is its own group.
+        """
+        state = dict(state)
+        state.setdefault("groups", None)
+        if "_fit_object" in state and "groups_" not in state:
+            names = tuple(state["regressor_names_"])
+            state["groups_"] = {name: (name,) for name in names}
+            state["group_names_"] = names
+        self.__dict__.update(state)
+
     def _params(self) -> dict[str, Any]:
         """Check every hyper-parameter; return them normalised."""
         out: dict[str, Any] = {}
+        groups = _group_spec(self.groups)
+        out["groups"] = groups
         ranks = self.ranks
         if isinstance(ranks, str):
             if ranks != "aic":
@@ -540,6 +617,7 @@ class MTDR:
                     f"ranks must be non-negative integers; got {ranks!r}"
                 )
             out["ranks"] = [int(r) for r in seq if r is not None]
+        _require_group_keyed("ranks", out["ranks"], groups)
         if self.estimator not in ("svd", "mmle"):
             raise ParameterError(
                 f"estimator must be 'svd' or 'mmle'; got {self.estimator!r}"
@@ -565,6 +643,17 @@ class MTDR:
                     f"sequence of positive int; got {init!r}"
                 )
             out["rank_search_init"] = init
+        elif isinstance(init, Mapping):
+            start: dict[str, int] = {}
+            for key, value in init.items():
+                r = as_int(value)
+                if r is None or r < 1 or not isinstance(key, str):
+                    raise ParameterError(
+                        "rank_search_init must map regressor (or group) names to "
+                        f"positive ints; got {dict(init)!r}"
+                    )
+                start[key] = r
+            out["rank_search_init"] = start
         else:
             entries = as_list(init)
             seq = [as_int(e) for e in entries] if entries else [None]
@@ -574,6 +663,7 @@ class MTDR:
                     f"non-empty sequence of positive int; got {init!r}"
                 )
             out["rank_search_init"] = [int(r) for r in seq if r is not None]
+        _require_group_keyed("rank_search_init", out["rank_search_init"], groups)
         out["rank_search_warm_start"] = _bool(
             "rank_search_warm_start", self.rank_search_warm_start
         )
@@ -649,9 +739,12 @@ class MTDR:
             zero residual.
         ParameterError
             For names of the wrong length or repeated; a `ranks` mapping that
-            does not name exactly the regressors, a sequence of the wrong
-            length, or a rank above `max_rank`; `max_rank` above
-            `min(n_neurons, n_bins)`.
+            does not name exactly the regressors (the groups, with `groups`), a
+            sequence of the wrong length, or a rank above `max_rank` (above
+            its group's cap); `max_rank` above `min(n_neurons, n_bins)` (above
+            the largest group's `min(n_neurons, |g| n_bins)`); `groups` that
+            name a column `X` does not have, or name a group after a column
+            outside it ([`resolve_groups`][mtdr.data.resolve_groups]).
         numpy.linalg.LinAlgError
             If a posterior precision $C_i$ fails its Cholesky.
 
@@ -701,27 +794,39 @@ class MTDR:
         _, n_neurons, n_bins = Y_v.shape
         P = X_v.shape[1]
         names = require_names(regressor_names, P)
-        cap = min(n_neurons, n_bins)
-        max_rank = cap if prm["max_rank"] is None else prm["max_rank"]
-        if max_rank > cap:
-            raise ParameterError(
-                f"max_rank is {max_rank}, above min(n_neurons, n_bins) = {cap}"
-            )
-        fixed = _fixed_ranks(prm["ranks"], names, max_rank)
+        groups = resolve_groups(names, prm["groups"])
+        position = {name: p for p, name in enumerate(names)}
+        grouping = _groups.as_grouping(
+            [[position[m] for m in members] for members in groups.values()], P
+        )
+        caps = _rank_caps(groups, n_neurons, n_bins, prm["max_rank"])
+        fixed = _fixed_ranks(
+            prm["ranks"],
+            groups,
+            caps,
+            explicit=prm["groups"] is not None,
+            capped=prm["max_rank"] is not None,
+        )
         for message in _soft_warnings(X_v, mask_v, names, prm["basis_ridge"]):
             warnings.warn(message, DesignWarning, stacklevel=2)
         uncentred = _uncentred_message(X_v, mask_v, names)
         if estimator == "mmle" and uncentred is not None:
             warnings.warn(uncentred, DesignWarning, stacklevel=2)
         stats = sufficient_statistics(Y_v, X_v, mask_v)
-        runner = _Runner(stats, prm, names, max_rank)
+        runner = _Runner(
+            stats,
+            prm,
+            tuple(groups),
+            caps,
+            None if grouping is None else grouping.groups,
+        )
         if fixed is not None:
             fit_obj = runner.single(fixed)
             history = None
         else:
             fit_obj, history = runner.search()
         runner.report()
-        self._store(fit_obj, history, stats, names, mask_v, prm)
+        self._store(fit_obj, history, stats, names, groups, mask_v, prm)
         return self
 
     def _store(
@@ -730,10 +835,12 @@ class MTDR:
         history: RankSearchHistory | None,
         stats: SufficientStats,
         names: tuple[str, ...],
+        groups: dict[str, tuple[str, ...]],
         mask: BoolArray,
         prm: dict[str, Any],
     ) -> None:
         """Set the fitted attributes from a fit object."""
+        group_names = tuple(groups)
         ranks = tuple(int(r) for r in fit_obj.ranks)
         B = tuple(np.array(b) for b in fit_obj.B)
         cov: FloatArray | None
@@ -752,7 +859,10 @@ class MTDR:
             n_iter = {}
             estimator = "svd"
         if prm["canonicalize"]:
-            W, S, R = _canonical(B, W_raw, ranks)
+            if fit_obj.groups is None:
+                W, S, R = _canonical(B, W_raw, ranks)
+            else:
+                W, S, R = _canonical_grouped(B, W_raw, ranks, fit_obj.groups)
             if cov is not None and any(ranks):
                 rot = scipy.linalg.block_diag(*R)
                 cov = rot.T @ cov @ rot
@@ -764,14 +874,16 @@ class MTDR:
         self._fit_object = fit_obj
         self._canonical_frame = bool(prm["canonicalize"])
         self.regressor_names_ = names
+        self.groups_ = dict(groups)
+        self.group_names_ = group_names
         self.n_trials_ = int(mask.shape[0])
         self.n_neurons_ = int(stats.n_neurons)
         self.n_bins_ = int(stats.n_bins)
         self.n_regressors_ = len(names)
         self.n_observations_ = np.array(stats.n_obs, dtype=np.int64)
-        self.ranks_ = dict(zip(names, ranks, strict=True))
+        self.ranks_ = dict(zip(group_names, ranks, strict=True))
         self.total_rank_ = int(sum(ranks))
-        self.W_ = dict(zip(names, W, strict=True))
+        self.W_ = dict(zip(group_names, W, strict=True))
         self.S_ = dict(zip(names, S, strict=True))
         self.B_ = dict(zip(names, B, strict=True))
         self.intercept_ = intercept
@@ -790,6 +902,52 @@ class MTDR:
     def _check_fitted(self) -> None:
         if "_fit_object" not in self.__dict__:
             raise NotFittedError("this MTDR instance is not fitted yet; call fit first")
+
+    # ------------------------------------------------------------------ groups
+
+    def _grouped(self) -> bool:
+        """Whether some group is not a single column named after itself."""
+        return any(members != (g,) for g, members in self.groups_.items())
+
+    def _owner(self) -> dict[str, str]:
+        """Return the group of every column."""
+        return {c: g for g, members in self.groups_.items() for c in members}
+
+    def _column_ranks(self) -> dict[str, int]:
+        """Return the rank of every column's group, keyed by column."""
+        owner = self._owner()
+        return {c: self.ranks_[owner[c]] for c in self.regressor_names_}
+
+    def _named_group(self, name: object) -> str | None:
+        """`name` if it names a group of several columns or a renamed one, else `None`.
+
+        A group named after its only column is that column.
+        """
+        if isinstance(name, str) and name in self.groups_:
+            members = self.groups_[name]
+            if len(members) > 1 or members != (name,):
+                return name
+        return None
+
+    def _group_key(self, name: object, what: str) -> str:
+        """Return `name` if it is a group; raise a `ParameterError` otherwise.
+
+        `what` names the argument for the messages.
+        """
+        if isinstance(name, str) and name in self.groups_:
+            return name
+        if isinstance(name, str) and name in self.regressor_names_:
+            group = self._owner()[name]
+            raise ParameterError(
+                f"{what} {name!r}: it is a column of group {group!r}, whose columns "
+                f"{list(self.groups_[group])} share one neural basis; name the "
+                f"group, {group!r}"
+            )
+        if not self._grouped():
+            raise ParameterError(
+                f"unknown regressor {name!r}; names {self.regressor_names_}"
+            )
+        raise ParameterError(f"unknown group {name!r}; groups {self.group_names_}")
 
     # ------------------------------------------------------------------ evaluation
 
@@ -1018,7 +1176,10 @@ class MTDR:
         over the observed neurons
         ([Nature Neuroscience supplement, §7](https://doi.org/10.1038/s41593-020-0696-5)).
         `regressor=None` solves jointly on the concatenated bases of every
-        regressor (`"gls"` only) and returns a dict.
+        regressor (`"gls"` only) and returns a dict. With groups, `regressor`
+        and the keys of `basis` and of the joint result are group names: a
+        group's columns share one basis, which the joint projection includes
+        once.
 
         A trial whose observed (weighted) basis lacks full column rank, at
         tolerance $\sqrt\epsilon$ relative to its largest singular value,
@@ -1032,7 +1193,8 @@ class MTDR:
         Y : array_like
             `(n_trials, n_neurons, n_bins)`, `NaN` allowed.
         regressor : str or None
-            A regressor name, or `None` for the joint projection.
+            A regressor name (a group name with groups), or `None` for the
+            joint projection.
         mask : array_like, optional
             `(n_trials, n_neurons)`.
         remove_intercept : bool
@@ -1043,18 +1205,21 @@ class MTDR:
             See above.
         basis : mapping of str to array_like, optional
             `(n_neurons, r)` bases replacing `W_[name]`, e.g. from
-            [`orthogonalize`][mtdr.model.MTDR.orthogonalize].
+            [`orthogonalize`][mtdr.model.MTDR.orthogonalize]; keyed by group
+            with groups.
 
         Returns
         -------
         numpy.ndarray or dict of str to numpy.ndarray
-            `(n_trials, n_bins, r)`, or one per regressor for `regressor=None`.
+            `(n_trials, n_bins, r)`, or one per regressor (per group) for
+            `regressor=None`.
 
         Raises
         ------
         ParameterError
             For an unknown regressor, a rank-0 regressor without a `basis`, a
-            bad `basis`, `method`, or `regressor=None` with `method="paper"`.
+            bad `basis`, `method`, or `regressor=None` with `method="paper"`;
+            for a column of a group of several columns, naming its group.
         SingularDesignError
             For `regressor=None` when the joint basis is rank-deficient (shared
             directions or `total_rank_ > n_neurons`), naming the regressors.
@@ -1094,14 +1259,12 @@ class MTDR:
         )
         if regressor is None:
             return self._project_joint(Yc, weights, mask_v, bases)
-        if regressor not in self.regressor_names_:
-            raise ParameterError(
-                f"unknown regressor {regressor!r}; names {self.regressor_names_}"
-            )
-        U = bases[regressor]
+        name = self._group_key(regressor, "regressor")
+        U = bases[name]
         if U is None:
+            unit = "group" if self._grouped() else "regressor"
             raise ParameterError(
-                f"regressor {regressor!r} has rank 0: nothing to project onto (pass "
+                f"{unit} {regressor!r} has rank 0: nothing to project onto (pass "
                 "a basis for it)"
             )
         if method == "paper":
@@ -1117,23 +1280,24 @@ class MTDR:
         mask: BoolArray,
         bases: dict[str, FloatArray | None],
     ) -> dict[str, FloatArray]:
+        unit = "group" if self._grouped() else "regressor"
         live = {n: b for n, b in bases.items() if b is not None and b.shape[1]}
-        names = [n for n in self.regressor_names_ if n in live]
+        names = [n for n in self.group_names_ if n in live]
         if not names:
-            raise ParameterError("every regressor has rank 0: nothing to project onto")
+            raise ParameterError(f"every {unit} has rank 0: nothing to project onto")
         joint = np.concatenate([live[n] for n in names], axis=1)
         shared = _joint_null(joint, [live[n].shape[1] for n in names], names)
         if shared is not None:
             raise SingularDesignError(
-                "the joint basis of the regressors is rank-deficient (they share "
+                f"the joint basis of the {unit}s is rank-deficient (they share "
                 f"directions, or total width {joint.shape[1]} exceeds n_neurons = "
-                f"{joint.shape[0]}); regressors involved: {shared}; project them one "
+                f"{joint.shape[0]}); {unit}s involved: {shared}; project them one "
                 "at a time, or orthogonalize first"
             )
         z = _gls(joint, weights, Yc, mask)
         out: dict[str, FloatArray] = {}
         offset = 0
-        for name in self.regressor_names_:
+        for name in self.group_names_:
             width = live[name].shape[1] if name in live else 0
             out[name] = np.ascontiguousarray(z[:, :, offset : offset + width])
             offset += width
@@ -1152,11 +1316,12 @@ class MTDR:
                 f"got {type(basis).__name__}"
             )
         for name, value in basis.items():
-            if name not in self.regressor_names_:
+            if name not in self.groups_ and not self._grouped():
                 raise ParameterError(
                     f"basis names unknown regressor {name!r}; names "
                     f"{self.regressor_names_}"
                 )
+            name = self._group_key(name, "basis key")
             arr = np.asarray(value)
             if (
                 arr.dtype.kind not in "iuf"
@@ -1182,7 +1347,7 @@ class MTDR:
         regressor: str | Sequence[str] | None = ...,
         mask: ArrayLike | None = ...,
         known: Mapping[str, ArrayLike] | None = ...,
-        levels: Mapping[str, Sequence[float]] | None = ...,
+        levels: Mapping[str, ArrayLike] | None = ...,
         bins: int | slice | Sequence[int] | None = ...,
         return_log_likelihood: Literal[False] = ...,
         return_llr: Literal[False] = ...,
@@ -1195,7 +1360,7 @@ class MTDR:
         regressor: str | Sequence[str] | None = ...,
         mask: ArrayLike | None = ...,
         known: Mapping[str, ArrayLike] | None = ...,
-        levels: Mapping[str, Sequence[float]] | None = ...,
+        levels: Mapping[str, ArrayLike] | None = ...,
         bins: int | slice | Sequence[int] | None = ...,
         *,
         return_log_likelihood: Literal[True],
@@ -1209,7 +1374,7 @@ class MTDR:
         regressor: str | Sequence[str] | None = ...,
         mask: ArrayLike | None = ...,
         known: Mapping[str, ArrayLike] | None = ...,
-        levels: Mapping[str, Sequence[float]] | None = ...,
+        levels: Mapping[str, ArrayLike] | None = ...,
         bins: int | slice | Sequence[int] | None = ...,
         *,
         return_log_likelihood: Literal[False] = ...,
@@ -1223,7 +1388,7 @@ class MTDR:
         regressor: str | Sequence[str] | None = ...,
         mask: ArrayLike | None = ...,
         known: Mapping[str, ArrayLike] | None = ...,
-        levels: Mapping[str, Sequence[float]] | None = ...,
+        levels: Mapping[str, ArrayLike] | None = ...,
         bins: int | slice | Sequence[int] | None = ...,
         *,
         return_log_likelihood: Literal[True],
@@ -1236,7 +1401,7 @@ class MTDR:
         regressor: str | Sequence[str] | None = None,
         mask: ArrayLike | None = None,
         known: Mapping[str, ArrayLike] | None = None,
-        levels: Mapping[str, Sequence[float]] | None = None,
+        levels: Mapping[str, ArrayLike] | None = None,
         bins: int | slice | Sequence[int] | None = None,
         return_log_likelihood: bool = False,
         return_llr: bool = False,
@@ -1261,6 +1426,15 @@ class MTDR:
         likelihood for level `b`. The decoder depends only on `B_`, so it is
         frame-independent.
 
+        With groups (`docs/model.md` § 11) the values stay per column.
+        `regressor` may name a group, which stands for its columns, and
+        `levels` may map a group to its candidate rows, each a value for every
+        column of the group in member order (`CategoricalDesign.rows()` for a
+        categorical coding): the rows are enumerated as one discrete unit,
+        never as the product of per-column levels, and count as one unit for
+        the cap of 64 combinations and for `return_llr`. A column of a group of
+        several columns cannot have levels of its own.
+
         A trial whose continuous-unknown normal matrix
         $\Xi_\mathcal U^\top\Lambda\Xi_\mathcal U$ is singular or has a
         condition number above $\epsilon^{-1/2}$ gets `NaN` outputs, and one
@@ -1273,13 +1447,17 @@ class MTDR:
             `(n_trials, n_neurons, n_bins)`, `NaN` allowed.
         regressor : str, sequence of str or None
             The regressors to decode; `None` is every regressor not in `known`.
-            Rank-0 regressors are ignored.
+            Rank-0 regressors are ignored. A group name stands for its
+            columns.
         mask : array_like, optional
             `(n_trials, n_neurons)`.
         known : mapping of str to array_like, optional
-            `{name: (n_trials,)}` values held fixed, in the coding used at `fit`.
-        levels : mapping of str to sequence of float, optional
-            Candidate values of decoded discrete regressors.
+            `{name: (n_trials,)}` values held fixed, in the coding used at `fit`
+            (per column, also for grouped columns).
+        levels : mapping of str to array_like, optional
+            Candidate values of decoded discrete regressors: a sequence of
+            numbers per regressor, or, for a group, a sequence of rows (a 2-D
+            array) of one value per column of the group.
         bins : int, slice, sequence of int or None
             The evidence window: one bin (the paper's instantaneous decoder), a
             slice, a list, or `None` for every bin.
@@ -1303,7 +1481,10 @@ class MTDR:
             If a name is both decoded and known, a regressor is in neither,
             `levels` names a regressor not decoded, there are more than 64 level
             combinations, `return_llr` lacks exactly one two-level discrete
-            regressor, every decoded regressor has rank 0, or `bins` is invalid.
+            regressor (or group with two rows), every decoded regressor has
+            rank 0, or `bins` is invalid; with groups also for levels of a
+            column of a group of several columns, malformed rows, or a group in
+            `levels` with a column in `known`.
         ValidationError
             On a shape mismatch or invalid data.
 
@@ -1330,11 +1511,12 @@ class MTDR:
         want_llr = _bool("return_llr", return_llr)
         Y_v, _, mask_v = self._evaluation_inputs(Y, None, mask)
         names = self.regressor_names_
-        live = [n for n in names if self.ranks_[n] > 0]
+        column_ranks = self._column_ranks()
+        live = [n for n in names if column_ranks[n] > 0]
         # Rank-0 names are checked, then ignored, before any value check.
         known_values = self._known(known, Y_v.shape[0], live)
         decoded = self._decoded(regressor, known_values, live)
-        level_sets = self._levels(levels, decoded, live)
+        units = self._levels(levels, decoded, live, known_values)
         missing = [n for n in live if n not in decoded and n not in known_values]
         if missing:
             raise ParameterError(
@@ -1345,18 +1527,23 @@ class MTDR:
             raise ParameterError(
                 "every decoded regressor has rank 0: nothing to decode from"
             )
-        discrete = [n for n in decoded if n in level_sets]
-        continuous = [n for n in decoded if n not in level_sets]
-        n_combos = math.prod(len(level_sets[n]) for n in discrete)
+        # A discrete unit is a column with its levels, or a group with its rows.
+        discrete = [column for columns, _ in units for column in columns]
+        continuous = [n for n in decoded if n not in discrete]
+        n_combos = math.prod(len(rows) for _, rows in units)
         if n_combos > _MAX_COMBINATIONS:  # before enumerating them
             raise ParameterError(
                 f"{n_combos} level combinations; at most {_MAX_COMBINATIONS}"
             )
-        combos = list(itertools.product(*(level_sets[n] for n in discrete)))
-        if want_llr and not (len(discrete) == 1 and len(level_sets[discrete[0]]) == 2):
+        combos = [
+            tuple(value for row in combo for value in row)
+            for combo in itertools.product(*(rows for _, rows in units))
+        ]
+        if want_llr and not (len(units) == 1 and len(units[0][1]) == 2):
+            grouped = " (or exactly one group with two rows)" if self._grouped() else ""
             raise ParameterError(
                 "return_llr needs exactly one discrete regressor with exactly two "
-                "levels"
+                f"levels{grouped}"
             )
         t_idx = self._bins(bins)
         result = _decode_trials(
@@ -1400,9 +1587,16 @@ class MTDR:
             )
         for name in known:
             if name not in self.regressor_names_:
+                hint = ""
+                group = self._named_group(name)
+                if group is not None:
+                    hint = (
+                        f" ({name!r} is a group: give the values of its columns "
+                        f"{list(self.groups_[group])})"
+                    )
                 raise ParameterError(
                     f"known names unknown regressor {name!r}; names "
-                    f"{self.regressor_names_}"
+                    f"{self.regressor_names_}{hint}"
                 )
         out: dict[str, FloatArray] = {}
         for name, value in known.items():
@@ -1423,7 +1617,11 @@ class MTDR:
     def _decoded(
         self, regressor: object, known: Mapping[str, Any], live: Sequence[str]
     ) -> list[str]:
-        """Return the live decoded names; `known` holds live names only."""
+        """Return the live decoded columns; `known` holds live names only.
+
+        A group name (of several columns, or not a column's own name) stands
+        for its columns, in member order.
+        """
         names = self.regressor_names_
         if regressor is None:
             return [n for n in live if n not in known]
@@ -1438,32 +1636,71 @@ class MTDR:
                 )
             requested = entries
         out: list[str] = []
-        for j, name in enumerate(requested):
-            if not isinstance(name, str) or name not in names:
+        seen: list[str] = []
+        for name in requested:
+            group = self._named_group(name)
+            if group is not None:
+                columns = list(self.groups_[group])
+            elif isinstance(name, str) and name in names:
+                columns = [name]
+            elif self._grouped():
+                raise ParameterError(
+                    f"unknown regressor or group {name!r}; columns {names}, groups "
+                    f"{self.group_names_}"
+                )
+            else:
                 raise ParameterError(f"unknown regressor {name!r}; names {names}")
-            if name in requested[:j]:
-                raise ParameterError(f"regressor {name!r} is listed twice")
-            if name not in live:
-                continue  # rank 0: ignored
-            if name in known:
-                raise ParameterError(f"regressor {name!r} is both decoded and known")
-            out.append(name)
+            for column in columns:
+                if column in seen:
+                    raise ParameterError(f"regressor {column!r} is listed twice")
+                seen.append(column)
+                if column not in live:
+                    continue  # rank 0: ignored
+                if column in known:
+                    raise ParameterError(
+                        f"regressor {column!r} is both decoded and known"
+                    )
+                out.append(column)
         return out
 
     def _levels(
-        self, levels: object, decoded: Sequence[str], live: Sequence[str]
-    ) -> dict[str, list[float]]:
+        self,
+        levels: object,
+        decoded: Sequence[str],
+        live: Sequence[str],
+        known: Mapping[str, Any],
+    ) -> list[tuple[tuple[str, ...], list[tuple[float, ...]]]]:
+        """Return the discrete units: their columns and candidate rows.
+
+        A column with its levels is a unit of one column whose rows hold one
+        value; a group with its candidate rows is one unit (`decode`). Units
+        are ordered by their first column's place among the decoded ones.
+        """
         if levels is None:
-            return {}
+            return []
         if not isinstance(levels, Mapping):
             raise ParameterError(
                 f"levels must be a mapping of name to candidate values; got "
                 f"{type(levels).__name__}"
             )
-        out: dict[str, list[float]] = {}
+        owner = self._owner()
+        units: list[tuple[tuple[str, ...], list[tuple[float, ...]]]] = []
         for name, values in levels.items():
+            group = self._named_group(name)
+            if group is not None:
+                unit = self._group_rows(group, values, decoded, known)
+                if unit is not None:
+                    units.append(unit)
+                continue
             if name in self.regressor_names_ and name not in live:
                 continue  # rank 0: ignored
+            if name in owner and len(self.groups_[owner[name]]) > 1:
+                g = owner[name]
+                raise ParameterError(
+                    f"levels names {name!r}, a column of group {g!r}, whose columns "
+                    "share one neural basis and are decoded together: give the "
+                    f"group's candidate rows, levels={{{g!r}: rows}}"
+                )
             if name not in decoded:
                 raise ParameterError(f"levels names {name!r}, which is not decoded")
             entries = as_list(values)
@@ -1473,8 +1710,50 @@ class MTDR:
                     f"levels[{name!r}] must be a non-empty sequence of finite real "
                     f"numbers; got {values!r}"
                 )
-            out[name] = [float(v) for v in reals if v is not None]
-        return out
+            units.append(((name,), [(float(v),) for v in reals if v is not None]))
+        units.sort(key=lambda unit: list(decoded).index(unit[0][0]))
+        return units
+
+    def _group_rows(
+        self,
+        group: str,
+        values: object,
+        decoded: Sequence[str],
+        known: Mapping[str, Any],
+    ) -> tuple[tuple[str, ...], list[tuple[float, ...]]] | None:
+        """Check a group's candidate rows; `None` for a rank-0 group (ignored)."""
+        members = self.groups_[group]
+        if self.ranks_[group] == 0:
+            return None
+        given = [m for m in members if m in known]
+        if given:
+            raise ParameterError(
+                f"levels names group {group!r}, but its columns {given} are known: "
+                "a group's candidate rows set every one of its columns"
+            )
+        absent = [m for m in members if m not in decoded]
+        if absent:
+            raise ParameterError(
+                f"levels names group {group!r}, but its columns {absent} are not "
+                f"decoded: decode the group (regressor={group!r})"
+            )
+        try:
+            rows = np.asarray(values)
+        except (TypeError, ValueError):
+            rows = np.zeros((0, 0))
+        if (
+            rows.dtype.kind not in "iuf"
+            or rows.ndim != 2
+            or rows.shape[0] == 0
+            or rows.shape[1] != len(members)
+            or not np.isfinite(rows).all()
+        ):
+            raise ParameterError(
+                f"levels[{group!r}] must be a non-empty sequence of candidate rows, "
+                f"each {len(members)} finite real numbers, one per column of "
+                f"{list(members)} in that order; got {values!r}"
+            )
+        return members, [tuple(float(v) for v in row) for row in rows]
 
     def _bins(self, bins: object) -> IntArray:
         T = self.n_bins_
@@ -1548,7 +1827,9 @@ class MTDR:
         keeps only term $p$: $\bar Y+X_{:p}B_p$ for a regressor, `intercept_`
         alone for `"intercept"` (present only when the model has one), and the
         full prediction (M1) for `"total"`. Terms are not orthogonal, so the
-        regressors' values need not add up to `"total"`. On held-out trials
+        regressors' values need not add up to `"total"`. With groups there is
+        one term per group, $\bar Y+\sum_{p\in g}X_{:p}B_p$, keyed by the group
+        name. On held-out trials
         $\bar Y_i$ is the held-out data's own mean, not the training one, so the
         baseline is the best flat prediction of those trials and a held-out
         `"total"` is not a training-mean comparison.
@@ -1569,8 +1850,8 @@ class MTDR:
         Returns
         -------
         dict of str to float or numpy.ndarray
-            Keys: the regressor names, `"intercept"` (with an intercept) and
-            `"total"`.
+            Keys: the regressor names (the group names, with groups),
+            `"intercept"` (with an intercept) and `"total"`.
 
         Raises
         ------
@@ -1615,9 +1896,13 @@ class MTDR:
                 "the explained variance is undefined"
             )
         out: dict[str, Any] = {}
-        for p, name in enumerate(self.regressor_names_):
-            pred = base + X_v[:, p, None, None] * self.B_[name][None]
-            out[name] = 1.0 - energy(pred) / total_energy
+        position = {name: p for p, name in enumerate(self.regressor_names_)}
+        for group, members in self.groups_.items():
+            pred: Any = base
+            for name in members:
+                p = position[name]
+                pred = pred + X_v[:, p, None, None] * self.B_[name][None]
+            out[group] = 1.0 - energy(pred) / total_energy
         if self.intercept_ is not None:
             out["intercept"] = 1.0 - energy(self.intercept_[None]) / total_energy
         out["total"] = 1.0 - energy(self.predict(X_v)) / total_energy
@@ -1638,13 +1923,15 @@ class MTDR:
         norm at most $\sqrt\epsilon$ (its norm before is 1) is dropped. So the
         width of regressor $p$ is $0\le r^{\rm disp}_p\le r_p$, and a subspace
         inside the earlier ones returns `(n_neurons, 0)`. Not a model frame;
-        feed it to `project(..., basis=...)`, never to `subspace_angles`.
+        feed it to `project(..., basis=...)`, never to `subspace_angles`. With
+        groups, `order` names groups, and a group's PC basis is that of its
+        concatenated coefficients $[B_p]_{p\in g}$ (`docs/model.md` § 11).
 
         Parameters
         ----------
         order : sequence of str
-            Regressor names, the first kept intact; others are omitted and
-            rank-0 ones skipped.
+            Regressor (group) names, the first kept intact; others are omitted
+            and rank-0 ones skipped.
 
         Returns
         -------
@@ -1654,7 +1941,8 @@ class MTDR:
         Raises
         ------
         ParameterError
-            For an unknown or repeated name.
+            For an unknown or repeated name, or a column of a group of several
+            columns (naming its group).
 
         Examples
         --------
@@ -1674,20 +1962,17 @@ class MTDR:
             raise ParameterError(f"order must be a sequence of names; got {order!r}")
         seen: list[str] = []
         for name in entries:
-            if not isinstance(name, str) or name not in self.regressor_names_:
-                raise ParameterError(
-                    f"unknown regressor {name!r}; names {self.regressor_names_}"
-                )
-            if name in seen:
-                raise ParameterError(f"regressor {name!r} is repeated in order")
-            seen.append(name)
+            group = self._group_key(name, "order entry")
+            if group in seen:
+                raise ParameterError(f"regressor {group!r} is repeated in order")
+            seen.append(group)
         Q = np.zeros((self.n_neurons_, 0))
         out: dict[str, FloatArray] = {}
         for name in seen:
             r = self.ranks_[name]
             if r == 0:
                 continue
-            U = _pc_basis(self.B_[name], r)[0]
+            U = _pc_basis(self._joined(name), r)[0]
             kept: list[FloatArray] = []
             for j in range(r):
                 v = U[:, j].copy()
@@ -1704,6 +1989,17 @@ class MTDR:
             Q = np.concatenate([Q, block], axis=1)
         return out
 
+    def _joined(self, group: str) -> FloatArray:
+        r"""Return $[B_p]_{p\in g}$, a group's coefficients side by side.
+
+        `(n_neurons, |g| n_bins)`; a single column's own `B_` entry.
+        """
+        members = self.groups_[group]
+        if len(members) == 1:
+            return self.B_[members[0]]
+        out: FloatArray = np.concatenate([self.B_[m] for m in members], axis=1)
+        return out
+
     def subspace_angles(self, a: str, b: str) -> FloatArray:
         r"""Principal angles between the column spaces of `W_[a]` and `W_[b]`.
 
@@ -1712,14 +2008,15 @@ class MTDR:
         correlations of the
         [Nature Neuroscience supplement, §8.2](https://doi.org/10.1038/s41593-020-0696-5)
         (`docs/model.md` § 9.3). Do not use the output of `orthogonalize`
-        here.
+        here. With groups, `a` and `b` name groups; the subspaces of different
+        groups need not be orthogonal.
 
         Parameters
         ----------
         a : str
-            A regressor name.
+            A regressor (group) name.
         b : str
-            Another (or the same) regressor name.
+            Another (or the same) regressor (group) name.
 
         Returns
         -------
@@ -1729,7 +2026,8 @@ class MTDR:
         Raises
         ------
         ParameterError
-            For an unknown name.
+            For an unknown name, or a column of a group of several columns
+            (naming its group).
 
         Examples
         --------
@@ -1742,11 +2040,7 @@ class MTDR:
         array([0., 0.])
         """
         self._check_fitted()
-        for name in (a, b):
-            if name not in self.regressor_names_:
-                raise ParameterError(
-                    f"unknown regressor {name!r}; names {self.regressor_names_}"
-                )
+        a, b = self._group_key(a, "a ="), self._group_key(b, "b =")
         Wa, Wb = self.W_[a], self.W_[b]
         if Wa.shape[1] == 0 or Wb.shape[1] == 0:
             return np.zeros(0)
@@ -1762,7 +2056,9 @@ class MTDR:
         Dims `regressor`, `neuron`, `time`, `component`; variables `B`, `W`,
         `S` (padded with `NaN` beyond each rank), `rank`, `intercept` (absent
         without one) and `noise_precision`; attributes `estimator`, `aic`,
-        `log_likelihood`, `n_parameters` and `mtdr_version`. See
+        `log_likelihood`, `n_parameters` and `mtdr_version`. With groups, `W`
+        and `rank` are over a `group` dimension and a `group_of` coordinate on
+        `regressor` records each column's group. See
         [`mtdr.xarray_io.to_dataset`][mtdr.xarray_io.to_dataset].
 
         Returns
@@ -1933,12 +2229,16 @@ class _Runner:
         stats: SufficientStats,
         prm: dict[str, Any],
         names: tuple[str, ...],
-        max_rank: int,
+        max_rank: list[int],
+        groups: tuple[tuple[int, ...], ...] | None = None,
     ) -> None:
         self.stats = stats
         self.prm = prm
+        # The names, caps and rank vectors of the search are per group; a
+        # regressor alone is a group, and `groups` (positional) is `None` then.
         self.names = names
         self.max_rank = max_rank
+        self.groups = groups
         self.ci: bool = prm["condition_independent"]
         self.deficient: set[int] = set()
         self.failed: list[tuple[str, tuple[int, ...], list[str]]] = []
@@ -1988,6 +2288,7 @@ class _Runner:
                 ridge=self.prm["ridge"],
                 condition_independent=self.ci,
                 precision_weighted=weighted,
+                groups=self.groups,
             ),
         )
         assert isinstance(out, SVDFit)
@@ -1997,7 +2298,7 @@ class _Runner:
         self, ranks: NDArray[np.int64], accepted: MMLEFit | None = None
     ) -> MMLEFit:
         """Fit the MMLE at `ranks`, from its SVD fit or warm from `accepted`."""
-        options = _mmle_options(self.prm)
+        options = _mmle_options(self.prm, self.groups)
 
         def run() -> MMLEFit:
             # verbose=2: each ECME / refinement line names its candidate.
@@ -2023,7 +2324,7 @@ class _Runner:
         if self.pool is None:
             return [fit(ranks) for ranks in trials]
         accepted = self.accepted if warm else None
-        options = _mmle_options(self.prm)
+        options = _mmle_options(self.prm, self.groups)
         jobs = [(self.stats, r, accepted, options, np.geterr()) for r in trials]
         try:
             results = _gather(self.pool, _pool_fit, jobs)
@@ -2059,13 +2360,14 @@ class _Runner:
         self.round = {}
 
     def _selection_score(self, fit: Any, ranks: NDArray[np.int64]) -> float:
-        """Return the MMLE search's selection AIC, with the count (M38)."""
+        """Return the MMLE search's selection AIC, with the count (M38), (M60)."""
         count = _aic.n_parameters_mmle(
             ranks,
             self.stats.n_neurons,
             self.stats.n_bins,
             condition_independent=self.ci,
             formula="reference",
+            groups=self.groups,
         )
         return _aic.aic(fit.log_likelihood, count)
 
@@ -2087,14 +2389,29 @@ class _Runner:
             "regressor_names": self.names,
             "verbose": p["verbose"],
         }
+        if isinstance(init, dict):
+            if set(init) != set(self.names):
+                noun = "regressors" if p["groups"] is None else "groups"
+                raise ParameterError(
+                    f"a rank_search_init mapping must name exactly the {noun} "
+                    f"{list(self.names)}; got {sorted(init)}"
+                )
+            init = [init[name] for name in self.names]
         if isinstance(init, list) and len(init) != P:
             raise ParameterError(
                 f"rank_search_init has {len(init)} entries; expected {P}"
             )
-        if isinstance(init, list) and max(init) > self.max_rank:
-            raise ParameterError(
-                f"rank_search_init {init} has a rank above max_rank = {self.max_rank}"
-            )
+        if isinstance(init, list):
+            for name, r, cap in zip(self.names, init, self.max_rank, strict=True):
+                if r > cap and self.groups is None:
+                    raise ParameterError(
+                        f"rank_search_init {init} has a rank above max_rank = {cap}"
+                    )
+                if r > cap:
+                    raise ParameterError(
+                        f"rank_search_init[{name!r}] is {r}, above the cap of group "
+                        f"{name!r}, {cap}"
+                    )
         best: MMLEFit | SVDFit
         if p["estimator"] == "svd":
             start = init if isinstance(init, list) else [1] * P
@@ -2117,9 +2434,9 @@ class _Runner:
             else:
                 start = init
             warm = p["rank_search_warm_start"]
-            # A round has one candidate per regressor below max_rank, and that
+            # A round has one candidate per regressor below its cap, and that
             # number only falls as the search goes on.
-            movable = sum(r < self.max_rank for r in start)
+            movable = sum(r < cap for r, cap in zip(start, self.max_rank, strict=True))
             n_workers = min(p["n_jobs"], movable)
             with contextlib.ExitStack() as stack:
                 # Started before the search's first fit, so that the workers
@@ -2193,6 +2510,7 @@ def _warm_start(
     ranks: NDArray[np.int64],
     ridge: float,
     condition_independent: bool,
+    groups: tuple[tuple[int, ...], ...] | None = None,
 ) -> MMLEFit:
     r"""Return the start for candidate `ranks` from the accepted fit.
 
@@ -2200,19 +2518,26 @@ def _warm_start(
     keeps the accepted $S$, $\lambda$ and $b$, and appends to $S_p$ the last
     component of the unweighted SVD fit at `ranks`, the column that fit's own
     cold start (M29) would add, carrying that fit's rank-deficient neurons as
-    the cold start does.
+    the cold start does. With `groups`, `ranks` are per group, and raising
+    group $g$ appends the last component of the grouped SVD fit (M58) to every
+    member's $S_p$.
     """
     raised = np.flatnonzero(ranks != np.asarray(accepted.ranks))
     assert raised.size == 1
-    p = int(raised[0])
-    assert ranks[p] == accepted.ranks[p] + 1
+    g = int(raised[0])
+    assert ranks[g] == accepted.ranks[g] + 1
     svd = fit_svd(
-        stats, ranks, ridge=ridge, condition_independent=condition_independent
+        stats,
+        ranks,
+        ridge=ridge,
+        condition_independent=condition_independent,
+        groups=groups,
     )
     S = list(accepted.S)
-    S[p] = np.column_stack([S[p], svd.S[p][:, -1]])
+    for p in (g,) if groups is None else groups[g]:
+        S[p] = np.column_stack([S[p], svd.S[p][:, -1]])
     start = MMLEFit.from_parameters(
-        stats, S, accepted.noise_precision, accepted.intercept
+        stats, S, accepted.noise_precision, accepted.intercept, groups=groups
     )
     return dataclasses.replace(start, rank_deficient_neurons=svd.rank_deficient_neurons)
 
@@ -2222,8 +2547,13 @@ def _truncated(message: str, limit: int = _REASON_CHARS) -> str:
     return message if len(message) <= limit else message[: limit - 3].rstrip() + "..."
 
 
-def _mmle_options(prm: dict[str, Any]) -> dict[str, Any]:
-    """Return `fit_mmle`'s keyword arguments from the checked hyper-parameters."""
+def _mmle_options(
+    prm: dict[str, Any], groups: tuple[tuple[int, ...], ...] | None = None
+) -> dict[str, Any]:
+    """Return `fit_mmle`'s keyword arguments from the checked hyper-parameters.
+
+    `groups` is the positional grouping of the fit (`None`: every column alone).
+    """
     names = (
         "condition_independent",
         "ecme_max_iter",
@@ -2240,6 +2570,7 @@ def _mmle_options(prm: dict[str, Any]) -> dict[str, Any]:
     out = {name: prm[name] for name in names}
     out["verbose"] = 2 if prm["verbose"] == 2 else 0
     out["basis_span_scale"] = BASIS_SPAN_SCALE if prm["basis_preconditioning"] else 1.0
+    out["groups"] = groups
     return out
 
 
@@ -2257,7 +2588,8 @@ def _run_mmle(
     init = None
     if accepted is not None:
         ci = options["condition_independent"]
-        init = _warm_start(stats, accepted, ranks, options["ridge"], ci)
+        groups = options.get("groups")
+        init = _warm_start(stats, accepted, ranks, options["ridge"], ci, groups)
         options = {**options, "basis_span_scale": 1.0}
     return fit_mmle(stats, ranks, init, **options)
 
@@ -2448,6 +2780,34 @@ def _canonical(
     return W, S, R
 
 
+def _canonical_grouped(
+    B: Sequence[FloatArray],
+    W_raw: Sequence[FloatArray],
+    ranks: Sequence[int],
+    groups: Sequence[Sequence[int]],
+) -> tuple[list[FloatArray], list[FloatArray], list[FloatArray]]:
+    r"""Return the grouped PC orientation and the maps of the covariance, (M62).
+
+    Per group, the SVD of the concatenated coefficients
+    $[B_p]_{p\in g}=U\Sigma V^\top$: $W_g=U$, $S_p=(V\Sigma)_{[p]}$, column
+    $p$'s block of $T$ rows, and $R_g$ with $U=W^{\rm raw}_gR_g$ (least
+    squares). `W` and `R` per group, `S` per column.
+    """
+    W: list[FloatArray] = []
+    R: list[FloatArray] = []
+    S: list[FloatArray | None] = [None] * len(B)
+    T = B[0].shape[1]
+    for members, Wg, r in zip(groups, W_raw, ranks, strict=True):
+        joined = np.concatenate([B[p] for p in members], axis=1)
+        U, s, V = _pc_basis(joined, r)
+        W.append(U)
+        VS = V * s
+        for j, p in enumerate(members):
+            S[p] = np.ascontiguousarray(VS[j * T : (j + 1) * T])
+        R.append(np.linalg.lstsq(Wg, U, rcond=None)[0] if r else np.zeros((0, 0)))
+    return W, [s for s in S if s is not None], R
+
+
 def _pc_basis(B: FloatArray, r: int) -> tuple[FloatArray, FloatArray, FloatArray]:
     """Top-`r` singular triplets of `B`, largest-entry-positive signs."""
     n, T = B.shape
@@ -2623,16 +2983,55 @@ def _decode_trials(
 # =========================================================================== arguments
 
 
+def _rank_caps(
+    groups: Mapping[str, tuple[str, ...]],
+    n_neurons: int,
+    n_bins: int,
+    max_rank: int | None,
+) -> list[int]:
+    r"""Return each group's rank cap $\min(n,\lvert g\rvert T,\texttt{max\_rank})$.
+
+    Raises if `max_rank` exceeds the largest group's $\min(n,\lvert g\rvert T)$
+    (with single columns, $\min(n,T)$).
+    """
+    sizes = [len(members) for members in groups.values()]
+    caps = [min(n_neurons, size * n_bins) for size in sizes]
+    if max_rank is None:
+        return caps
+    top = max(caps)
+    if max_rank > top:
+        if max(sizes) == 1:
+            raise ParameterError(
+                f"max_rank is {max_rank}, above min(n_neurons, n_bins) = {top}"
+            )
+        raise ParameterError(
+            f"max_rank is {max_rank}, above the largest group cap, min(n_neurons, "
+            f"|g| n_bins) = {top}"
+        )
+    return [min(cap, max_rank) for cap in caps]
+
+
 def _fixed_ranks(
-    spec: object, names: tuple[str, ...], max_rank: int
+    spec: object,
+    groups: Mapping[str, tuple[str, ...]],
+    caps: Sequence[int],
+    *,
+    explicit: bool = False,
+    capped: bool = True,
 ) -> list[int] | None:
-    """Resolve a fixed `ranks` specification against the names."""
+    """Resolve a fixed `ranks` specification against the groups' names and caps.
+
+    `explicit` says whether `groups` was given (the messages name groups), and
+    `capped` whether `max_rank` was (the messages show the cap's formula).
+    """
+    names = tuple(groups)
     if spec == "aic":
         return None
     if isinstance(spec, dict):
         if set(spec) != set(names):
+            noun = "groups" if explicit else "regressors"
             raise ParameterError(
-                f"a ranks mapping must name exactly the regressors {list(names)}; got "
+                f"a ranks mapping must name exactly the {noun} {list(names)}; got "
                 f"{sorted(spec)}"
             )
         ranks = [spec[n] for n in names]
@@ -2643,10 +3042,43 @@ def _fixed_ranks(
                 f"ranks has {len(spec)} entries; X has {len(names)} regressors"
             )
         ranks = list(spec)
-    for name, r in zip(names, ranks, strict=True):
-        if r > max_rank:
-            raise ParameterError(f"ranks[{name!r}] is {r}, above max_rank = {max_rank}")
+    for name, r, cap in zip(names, ranks, caps, strict=True):
+        if r > cap and len(groups[name]) == 1 and len(set(caps)) == 1:
+            raise ParameterError(f"ranks[{name!r}] is {r}, above max_rank = {cap}")
+        if r > cap:
+            limit = ", max_rank" if capped else ""
+            raise ParameterError(
+                f"ranks[{name!r}] is {r}, above the cap of group {name!r}, "
+                f"min(n_neurons, {len(groups[name])} * n_bins{limit}) = {cap}"
+            )
     return ranks
+
+
+def _require_group_keyed(
+    name: str, value: object, groups: dict[str, tuple[str, ...]] | None
+) -> None:
+    """With explicit `groups`, a `ranks`-like argument is a mapping of group names.
+
+    A sequence would be ambiguous (columns or groups?), and a key that is a
+    column of a group of several columns names something without a rank.
+    """
+    if groups is None:
+        return
+    if isinstance(value, list):
+        raise ParameterError(
+            f"pass {name} as a mapping of group name to int when groups are given; "
+            f"got the sequence {value}"
+        )
+    if isinstance(value, dict):
+        owner = {m: g for g, members in groups.items() for m in members}
+        for key in value:
+            group = owner.get(key)
+            if group is not None and group != key and len(groups[group]) > 1:
+                raise ParameterError(
+                    f"{name} names {key!r}, a column of group {group!r}, whose "
+                    f"columns {list(groups[group])} share one rank: give "
+                    f"{name}[{group!r}]"
+                )
 
 
 def _column_names(X: object) -> list[str] | None:

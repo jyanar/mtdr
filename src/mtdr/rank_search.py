@@ -409,7 +409,7 @@ def greedy_aic(
     fit: Callable[[IntArray], Any],
     objective: Callable[[Any, IntArray], float],
     init_ranks: Sequence[int] | NDArray[np.integer[Any]],
-    max_rank: int,
+    max_rank: int | Sequence[int] | NDArray[np.integer[Any]],
     threshold: float = 0.0,
     regressor_names: Sequence[str] | None = None,
     verbose: int = 0,
@@ -420,7 +420,8 @@ def greedy_aic(
 
     With $F(r)=$ `objective(fit(r), r)` and $r^{(0)}=$ `init_ranks`, each
     round evaluates $F(r+e_p)$ for every regressor $p$ with $r_p<$
-    `max_rank` (in regressor order), takes $p^*$, the candidate with the
+    `max_rank` (its own entry of `max_rank` when that is a sequence; in
+    regressor order), takes $p^*$, the candidate with the
     smallest score (the lowest index on ties), and accepts it iff
 
     $$
@@ -445,12 +446,13 @@ def greedy_aic(
         infeasible candidate; `NaN` and `-inf` (an unbounded likelihood, which
         would win every round and freeze the search) are errors.
     init_ranks : sequence of int or 1-D integer array
-        Positive starting ranks, each at most `max_rank`.
-    max_rank : int
-        Largest rank any regressor may reach, positive. For the SVD estimator
-        it may not exceed `min(n_neurons, n_bins)`, which `fit_svd` enforces
-        when the search reaches it, part-way through (`MTDR` bounds it up
-        front).
+        Positive starting ranks, each at most its `max_rank`.
+    max_rank : int, or sequence of int or 1-D integer array
+        Largest rank any regressor may reach, positive; or one cap per
+        regressor (the per-group caps $\min(n,\lvert g\rvert T)$ of a grouped
+        `MTDR` search, `docs/model.md` § 11). For the SVD estimator a cap may
+        not exceed the fit's own limit, which `fit_svd` enforces when the
+        search reaches it, part-way through (`MTDR` bounds it up front).
     threshold : float
         $\delta\ge0$, finite.
     regressor_names : sequence of str, optional
@@ -484,7 +486,8 @@ def greedy_aic(
         For a non-callable `fit`, `objective`, `callback` or `fit_many`; a
         `fit_many` that returns the wrong number of fits; `init_ranks` not a
         sequence of positive integers or above `max_rank`; a non-positive
-        `max_rank`; a negative or non-finite `threshold`; bad names; `verbose`
+        `max_rank`, or a sequence of them of the wrong length; a negative or
+        non-finite `threshold`; bad names; `verbose`
         not 0, 1 or 2; or an objective that returns `NaN`, `-inf` or a
         non-number.
         Errors raised by `fit`, `objective` or `fit_many` propagate.
@@ -524,10 +527,11 @@ def greedy_aic(
         if hook is not None and not callable(hook):
             raise ParameterError(f"{name} must be callable or None; got {hook!r}")
     init = require_int_vector("init_ranks", init_ranks, minimum=1)
-    cap = positive_int("max_rank", max_rank)
+    caps = _caps(max_rank, len(init))
     for p, r in enumerate(init):
-        if r > cap:
-            raise ParameterError(f"init_ranks[{p}] is {r}, above max_rank = {cap}")
+        if r > caps[p]:
+            where = "max_rank" if as_list(max_rank) is None else f"max_rank[{p}]"
+            raise ParameterError(f"init_ranks[{p}] is {r}, above {where} = {caps[p]}")
     delta = require_non_negative_real("threshold", threshold)
     names = require_names(regressor_names, len(init))
     level = as_int(verbose)
@@ -547,7 +551,7 @@ def greedy_aic(
         print(f"rank search ({estimator}): step 0: {_fmt(names, current)}, {score:.6g}")
 
     while True:
-        movable = [p for p in range(current.size) if current[p] < cap]
+        movable = [p for p in range(current.size) if current[p] < caps[p]]
         if not movable:
             candidates.append({})
             stop_reason = "max_rank"
@@ -608,6 +612,19 @@ def greedy_aic(
         stop_reason=stop_reason,
     )
     return current_fit, history
+
+
+def _caps(max_rank: object, n_entries: int) -> list[int]:
+    """Return one positive cap per entry: an int for all, or a sequence of them."""
+    entries = as_list(max_rank)
+    if entries is None:
+        return [positive_int("max_rank", max_rank)] * n_entries
+    if len(entries) != n_entries:
+        raise ParameterError(
+            f"max_rank has {len(entries)} entries; expected one per regressor "
+            f"({n_entries}), or a single int"
+        )
+    return [positive_int(f"max_rank[{p}]", cap) for p, cap in enumerate(entries)]
 
 
 def _score(value: object, ranks: IntArray) -> float:

@@ -85,11 +85,11 @@ def test_the_walk_sees_the_api() -> None:
 
 
 def test_mtdr_documents_its_fitted_attributes() -> None:
-    # The 23 fitted attributes, in the class docstring the site renders.
+    # The 25 fitted attributes, in the class docstring the site renders.
     doc = inspect.getdoc(mtdr.MTDR) or ""
     section = doc.split("Attributes\n----------\n", 1)[1].split("\nRaises\n", 1)[0]
     listed = re.findall(r"^(\w+_) : ", section, re.MULTILINE)
-    assert len(listed) == len(set(listed)) == 23
+    assert len(listed) == len(set(listed)) == 25
     assert set(listed) == set(mtdr.model._FITTED)
     assert "marginal" in section
     assert "plug-in" in section

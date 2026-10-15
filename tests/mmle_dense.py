@@ -280,6 +280,137 @@ def compat_basis_step(
     return [new[offsets[p] : offsets[p + 1]].T for p in range(len(S))]
 
 
+# --------------------------------------------------------------------------- groups
+#
+# The grouped model of `docs/model.md` § 11, (M52): the columns of a group share
+# one latent weight vector, so neuron i's design has one column block per group,
+# the sum over the group's columns of kron(X_i[:, p], S_p). Built from that
+# equation, neuron by neuron, with no expanded components and no tie matrix.
+
+
+def grouped_design(
+    X_i: FloatArray, S: Sequence[FloatArray], groups: Sequence[Sequence[int]]
+) -> FloatArray:
+    """Phi_i of (M52), `(n_i T, r_lat)`: block g is sum_{p in g} kron(x_p, S_p)."""
+    T = S[0].shape[0]
+    blocks = []
+    for members in groups:
+        r = S[members[0]].shape[1]
+        block = np.zeros((X_i.shape[0] * T, r))
+        for p in members:
+            block += np.kron(X_i[:, [p]], S[p])
+        if r:
+            blocks.append(block)
+    if not blocks:
+        return np.zeros((X_i.shape[0] * T, 0))
+    return np.concatenate(blocks, axis=1)
+
+
+def _grouped_neuron(
+    Y: FloatArray,
+    X: FloatArray,
+    mask: BoolArray,
+    S: Sequence[FloatArray],
+    lam: FloatArray,
+    b: FloatArray | None,
+    groups: Sequence[Sequence[int]],
+    i: int,
+) -> tuple[FloatArray, FloatArray, FloatArray]:
+    """Return (Phi_i, the centred responses z, the marginal covariance Sigma_i)."""
+    X_i, Y_i = _neuron(Y, X, mask, i)
+    Phi = grouped_design(X_i, S, groups)
+    z = Y_i.ravel()
+    if b is not None:
+        z = z - np.tile(b[i], X_i.shape[0])
+    Sigma = np.eye(z.size) / lam[i] + Phi @ Phi.T
+    return Phi, z, Sigma
+
+
+def grouped_nll(
+    Y: FloatArray,
+    X: FloatArray,
+    mask: BoolArray,
+    S: Sequence[FloatArray],
+    lam: FloatArray,
+    b: FloatArray | None,
+    groups: Sequence[Sequence[int]],
+) -> FloatArray:
+    """Per-neuron fully normalised NLL of the grouped marginal Gaussian."""
+    out = np.zeros(Y.shape[1])
+    for i in range(Y.shape[1]):
+        if not mask[:, i].any():
+            continue
+        _, z, Sigma = _grouped_neuron(Y, X, mask, S, lam, b, groups, i)
+        logdet = np.linalg.slogdet(Sigma)[1]
+        out[i] = 0.5 * (
+            logdet + z @ np.linalg.solve(Sigma, z) + z.size * np.log(2 * np.pi)
+        )
+    return out
+
+
+def grouped_posterior(
+    Y: FloatArray,
+    X: FloatArray,
+    mask: BoolArray,
+    S: Sequence[FloatArray],
+    lam: FloatArray,
+    b: FloatArray | None,
+    groups: Sequence[Sequence[int]],
+) -> tuple[FloatArray, FloatArray]:
+    """Posterior mean and covariance of the latent weights, by direct conditioning."""
+    rlat = sum(S[members[0]].shape[1] for members in groups)
+    n = Y.shape[1]
+    means = np.zeros((n, rlat))
+    covs = np.broadcast_to(np.eye(rlat), (n, rlat, rlat)).copy()
+    for i in range(n):
+        if not mask[:, i].any():
+            continue
+        Phi, z, Sigma = _grouped_neuron(Y, X, mask, S, lam, b, groups, i)
+        gain = np.linalg.solve(Sigma, Phi).T  # Phi' Sigma^{-1}
+        means[i] = gain @ z
+        covs[i] = np.eye(rlat) - gain @ Phi
+    return means, covs
+
+
+def grouped_gls_intercept(
+    Y: FloatArray,
+    X: FloatArray,
+    mask: BoolArray,
+    S: Sequence[FloatArray],
+    lam: FloatArray,
+    groups: Sequence[Sequence[int]],
+) -> FloatArray:
+    """GLS mean of zeta_i ~ N(1 (x) b_i, Sigma_i) under the grouped covariance."""
+    n, T = Y.shape[1], Y.shape[2]
+    out = np.zeros((n, T))
+    for i in range(n):
+        X_i, Y_i = _neuron(Y, X, mask, i)
+        Phi = grouped_design(X_i, S, groups)
+        Sigma_inv = np.linalg.inv(np.eye(Y_i.size) / lam[i] + Phi @ Phi.T)
+        M = np.kron(np.ones((X_i.shape[0], 1)), np.eye(T))
+        out[i] = np.linalg.solve(M.T @ Sigma_inv @ M, M.T @ Sigma_inv @ Y_i.ravel())
+    return out
+
+
+def grouped_expected_residual(
+    Y: FloatArray,
+    X: FloatArray,
+    mask: BoolArray,
+    S: Sequence[FloatArray],
+    lam: FloatArray,
+    b: FloatArray | None,
+    groups: Sequence[Sequence[int]],
+) -> FloatArray:
+    """E ||zeta_i - Phi_i w_i||^2 under the grouped posterior, (M27b), (M30)."""
+    means, covs = grouped_posterior(Y, X, mask, S, lam, b, groups)
+    out = np.zeros(Y.shape[1])
+    for i in range(Y.shape[1]):
+        Phi, z, _ = _grouped_neuron(Y, X, mask, S, lam, b, groups, i)
+        resid = z - Phi @ means[i]
+        out[i] = resid @ resid + np.trace(Phi @ covs[i] @ Phi.T)
+    return out
+
+
 def compat_intercept_step(
     stats: SufficientStats,
     S_old: Sequence[FloatArray],

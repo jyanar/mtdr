@@ -16,7 +16,11 @@ estimator and never fit anything:
   sessions into one union-trial tensor with a block-diagonal mask, the
   observation model (M3), (M9) the estimators are written for;
 - [`split_trials`][mtdr.data.split_trials] draws a trial split for held-out
-  comparisons.
+  comparisons;
+- [`resolve_groups`][mtdr.data.resolve_groups] resolves `MTDR(groups=...)`
+  against the column names, and
+  [`categorical_design`][mtdr.data.categorical_design] codes a categorical
+  regressor as one group of orthonormal zero-sum columns (`docs/model.md` § 11).
 
 The package never centres or rescales `X` or `Y`.
 """
@@ -24,14 +28,16 @@ The package never centres or rescales `X` or `Y`.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
+import scipy.linalg
 from numpy.typing import ArrayLike, NDArray
 
 from mtdr._args import (
+    RESERVED_NAMES,
     as_int,
     as_list,
     as_real,
@@ -43,12 +49,18 @@ from mtdr.errors import DesignWarning, ParameterError, ValidationError
 from mtdr.stats import sufficient_statistics
 from mtdr.svd_fit import RANK_TOLERANCE, _least_squares, _normal_equations
 
+if TYPE_CHECKING:
+    from mtdr.model import MTDR
+
 __all__ = [
+    "CategoricalDesign",
     "ConditionAverage",
     "DesignReport",
     "StackedSessions",
+    "categorical_design",
     "check_design",
     "condition_average",
+    "resolve_groups",
     "split_trials",
     "stack_sessions",
     "validate_inputs",
@@ -686,7 +698,8 @@ def _design_problems(
     rank = _rank(Xr)
     if rank < P:
         problems.append(
-            f"X has rank {rank} < {P} columns (exactly collinear columns); drop the "
+            f"X has rank {rank} < {P} columns (exactly collinear columns, for "
+            "example a categorical level absent from the fitted trials); drop the "
             "redundant ones"
         )
     if ci:
@@ -701,7 +714,8 @@ def _design_problems(
             problems.append(
                 "a combination of the columns of X is constant, so it is collinear "
                 "with the intercept: with condition_independent=True an indicator "
-                "coding must drop one level"
+                "coding must drop one level (for example, a categorical level "
+                "absent from the fitted trials)"
             )
     return problems
 
@@ -1205,6 +1219,551 @@ def split_trials(
     test_idx = np.array(sorted(test), dtype=np.int64)
     train_idx = np.setdiff1d(np.arange(n), test_idx).astype(np.int64)
     return train_idx, test_idx
+
+
+# =========================================================================== groups
+
+
+def resolve_groups(
+    regressor_names: Sequence[str], groups: Mapping[str, Sequence[str]] | None
+) -> dict[str, tuple[str, ...]]:
+    r"""Resolve regressor groups against the column names: every group, in order.
+
+    The single implementation of the rules of
+    [`MTDR(groups=...)`][mtdr.model.MTDR] (`docs/model.md` § 11): `fit` calls
+    it, and a caller can call it to order rank tuples before fitting. `groups`
+    maps each group name to its member columns; a column it does not list is
+    a group of its own, named after the column. Groups are ordered by their
+    smallest member's column index and members by column index, so the
+    mapping's insertion order is irrelevant.
+
+    Parameters
+    ----------
+    regressor_names : sequence of str
+        The columns of `X`, in order (unique; `"intercept"` and `"total"` are
+        reserved).
+    groups : mapping of str to sequence of str, or None
+        Group name to member column names; `None` makes every column its own
+        group.
+
+    Returns
+    -------
+    dict of str to tuple of str
+        Every group, single columns included, in group order: `{group:
+        (member, ...)}`.
+
+    Raises
+    ------
+    ParameterError
+        If `groups` is not a mapping; a group name is not a non-empty string
+        or is reserved; a member list is a bare string, empty, or holds a
+        non-string; a column is listed twice, within or across groups; a member
+        is not a column (the message lists the columns); a group name is a
+        column outside that group, including a column that is a group of its
+        own.
+
+    Examples
+    --------
+    >>> from mtdr import resolve_groups
+    >>> names = ["choice", "sa_1", "sa_2", "sa_3", "sa_4"]
+    >>> resolve_groups(names, {"sa": ["sa_2", "sa_1", "sa_3", "sa_4"]})
+    {'choice': ('choice',), 'sa': ('sa_1', 'sa_2', 'sa_3', 'sa_4')}
+    >>> resolve_groups(["a", "b"], None)
+    {'a': ('a',), 'b': ('b',)}
+    """
+    entries = as_list(regressor_names)
+    if entries is None:
+        raise ParameterError(
+            f"regressor_names must be a sequence of str; got {regressor_names!r}"
+        )
+    names = require_names(entries, len(entries))
+    spec = _group_spec(groups)
+    if spec is None:
+        return {name: (name,) for name in names}
+    index = {name: p for p, name in enumerate(names)}
+    owner: dict[str, str] = {}
+    for group, members in spec.items():
+        unknown = [m for m in members if m not in index]
+        if unknown:
+            raise ParameterError(
+                f"groups[{group!r}] names {unknown}, which are not columns of X; the "
+                f"columns are {list(names)}"
+            )
+        owner.update(dict.fromkeys(members, group))
+    for group in spec:
+        if group in index and owner.get(group) != group:
+            if group in owner:
+                raise ParameterError(
+                    f"group name {group!r} is a column of group {owner[group]!r}: a "
+                    "group may be named after one of its own columns only"
+                )
+            raise ParameterError(
+                f"group name {group!r} is a column that no group lists, so it is "
+                f"also the name of that column's own group; rename group {group!r}"
+            )
+    resolved = [
+        (group, tuple(sorted(members, key=index.__getitem__)))
+        for group, members in spec.items()
+    ]
+    resolved += [(name, (name,)) for name in names if name not in owner]
+    resolved.sort(key=lambda item: index[item[1][0]])
+    return dict(resolved)
+
+
+def _group_spec(groups: object) -> dict[str, tuple[str, ...]] | None:
+    """Check `groups` without the column names (`MTDR`'s constructor checks)."""
+    if groups is None:
+        return None
+    if not isinstance(groups, Mapping):
+        raise ParameterError(
+            "groups must be a mapping of group name to a sequence of column names, "
+            f"or None; got {type(groups).__name__}"
+        )
+    out: dict[str, tuple[str, ...]] = {}
+    where: dict[str, str] = {}
+    for group, members in groups.items():
+        if not isinstance(group, str) or not group:
+            raise ParameterError(
+                f"group names must be non-empty strings; got {group!r}"
+            )
+        if group in RESERVED_NAMES:
+            raise ParameterError(f"group name {group!r} is reserved")
+        if isinstance(members, str | bytes):
+            raise ParameterError(
+                f"groups[{group!r}] is the string {members!r}; give a sequence of "
+                f"column names, e.g. [{members!r}]"
+            )
+        entries = as_list(members)
+        if not entries:
+            raise ParameterError(
+                f"groups[{group!r}] must be a non-empty sequence of column names; "
+                f"got {members!r}"
+            )
+        for member in entries:
+            if not isinstance(member, str):
+                raise ParameterError(
+                    f"groups[{group!r}] holds {member!r}, which is not a column name"
+                )
+            if member in where:
+                other = where[member]
+                place = "twice in it" if other == group else f"in {other!r} too"
+                raise ParameterError(
+                    f"column {member!r} of group {group!r} appears {place}: a column "
+                    "belongs to one group"
+                )
+            where[member] = group
+        out[group] = tuple(str(m) for m in entries)
+    return out
+
+
+@dataclass(frozen=True, eq=False)
+class CategoricalDesign:
+    r"""A categorical regressor coded as one group of orthonormal zero-sum columns.
+
+    Returned by [`categorical_design`][mtdr.data.categorical_design]. With
+    $L$ levels, one-hot indicators $D$ and a fixed basis $Q$ of shape
+    $(L, L-1)$ with orthonormal columns orthogonal to $\mathbf 1$, the design
+    is $X=DQ$ and the level responses of a fitted group are
+    $B_a=\sum_pQ_{ap}B_p$, which sum to zero over the levels
+    (`docs/model.md` § 11.7). Arrays are read-only, also after unpickling.
+
+    Attributes
+    ----------
+    name : str
+        The group's name; the columns are named after it.
+    levels : numpy.ndarray
+        `(L,)`, the levels in coding order.
+    counts : numpy.ndarray
+        `(L,)` int, trials per level among the coded values.
+    basis : numpy.ndarray
+        `(L, L - 1)`, $Q$: row $a$ codes level $a$.
+    columns : tuple of str
+        `(f"{name}_1", ..., f"{name}_{L-1}")`.
+    X : numpy.ndarray
+        `(n_trials, L - 1)`, the coded values, $Q$'s row of each trial's level.
+    """
+
+    name: str
+    levels: NDArray[Any]
+    counts: IntArray
+    basis: FloatArray
+    columns: tuple[str, ...]
+    X: FloatArray
+
+    def __post_init__(self) -> None:
+        """Make the arrays read-only."""
+        freeze([self.levels, self.counts, self.basis, self.X])
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore a pickled object with its arrays read-only again."""
+        restore_frozen(self, state)
+
+    def __repr__(self) -> str:
+        """Summarise the coding instead of printing the arrays."""
+        return (
+            f"CategoricalDesign(name={self.name!r}, levels={self.levels.tolist()}, "
+            f"counts={self.counts.tolist()}, columns={list(self.columns)})"
+        )
+
+    @property
+    def groups(self) -> dict[str, tuple[str, ...]]:
+        """`{name: columns}`, a new dict, ready to merge into `MTDR(groups=...)`."""
+        return {self.name: self.columns}
+
+    def encode(self, values: ArrayLike) -> FloatArray:
+        """Code labels as rows of the basis, for held-out or new trials.
+
+        Parameters
+        ----------
+        values : array_like
+            `(n_trials,)` labels, each one of `levels`. Levels absent from
+            `values` are allowed (held-out data may lack some).
+
+        Returns
+        -------
+        numpy.ndarray
+            `(n_trials, L - 1)`, a new array.
+
+        Raises
+        ------
+        ValidationError
+            For values that are not 1-D, missing (`NaN` or `None`), or not
+            among `levels` (the message lists those labels).
+        """
+        index = _level_index(values, self.levels, "values")
+        out: FloatArray = np.array(self.basis[index])
+        return out
+
+    def rows(self) -> FloatArray:
+        """Return the `L` candidate rows of the group for `MTDR.decode`'s `levels`.
+
+        Returns
+        -------
+        numpy.ndarray
+            `(L, L - 1)`, a copy of `basis`: row `a` is level `a`'s coding.
+        """
+        out: FloatArray = np.array(self.basis)
+        return out
+
+    def level_responses(self, model: MTDR) -> FloatArray:
+        r"""Return each level's coefficient matrix $B_a=\sum_pQ_{ap}B_p$, (M61).
+
+        Add `model.intercept_` to obtain the level means; the responses sum to
+        zero over the levels.
+
+        Parameters
+        ----------
+        model : MTDR
+            A fitted model in which the coding's columns form exactly one group.
+
+        Returns
+        -------
+        numpy.ndarray
+            `(L, n_neurons, n_bins)`.
+
+        Raises
+        ------
+        ParameterError
+            Unless the coding's columns form exactly one group of `model`.
+        """
+        self._group_of(model)
+        B = np.stack([model.B_[column] for column in self.columns])
+        out: FloatArray = np.einsum("ap,pit->ait", self.basis, B)
+        return out
+
+    def labels_from_rows(
+        self, values: Mapping[str, ArrayLike] | ArrayLike
+    ) -> np.ma.MaskedArray[Any, Any]:
+        """Map decoded rows back to level labels.
+
+        Parameters
+        ----------
+        values : mapping of str to array_like, or array_like
+            `MTDR.decode` output (a mapping that holds every column of the
+            coding; other keys are ignored), or an `(n_trials, L - 1)` array
+            with the columns in coding order.
+
+        Returns
+        -------
+        numpy.ma.MaskedArray
+            `(n_trials,)` labels, masked where the decoded row is `NaN` (a
+            trial the decoder could not decode).
+
+        Raises
+        ------
+        ValidationError
+            If a row is not within $10^{-9}$ of the basis scale of a level's
+            row (the message lists the first such trials), or the input has the
+            wrong shape or misses a column.
+        """
+        rows = self._decoded_rows(values)
+        missing = np.isnan(rows).any(axis=1)
+        with np.errstate(invalid="ignore"):
+            distance = np.abs(rows[:, None, :] - self.basis[None, :, :]).max(axis=2)
+        distance = np.where(np.isnan(distance), np.inf, distance)
+        nearest = np.argmin(distance, axis=1)
+        tol = 1e-9 * float(np.abs(self.basis).max())
+        closest = distance[np.arange(rows.shape[0]), nearest]
+        off = np.flatnonzero(~missing & ~(closest <= tol))
+        if off.size:
+            raise ValidationError(
+                f"decoded rows of trials {_listed(off)} match no level of "
+                f"{self.name!r} to within {tol:.3g}; decode with "
+                f"levels={{{self.name!r}: design.rows()}} to obtain level rows"
+            )
+        labels = self.levels[np.where(missing, 0, nearest)]
+        return np.ma.MaskedArray(labels, mask=missing)
+
+    def _group_of(self, model: MTDR) -> str:
+        """Return the group of `model` whose columns are exactly this coding's."""
+        model._check_fitted()
+        wanted = set(self.columns)
+        found = [g for g, members in model.groups_.items() if set(members) == wanted]
+        if len(found) != 1:
+            owners = sorted(
+                {g for g, members in model.groups_.items() if wanted & set(members)}
+            )
+            raise ParameterError(
+                f"the columns {list(self.columns)} of {self.name!r} do not form one "
+                f"group of the model (they are in groups {owners}); fit with "
+                f"groups={{{self.name!r}: {list(self.columns)}}}"
+            )
+        return found[0]
+
+    def _decoded_rows(self, values: object) -> FloatArray:
+        k = len(self.columns)
+        if isinstance(values, Mapping):
+            absent = [c for c in self.columns if c not in values]
+            if absent:
+                raise ValidationError(
+                    f"values lacks the columns {absent} of {self.name!r}; pass the "
+                    "output of decode for the whole group"
+                )
+            parts = [_as_array(f"values[{c!r}]", values[c]) for c in self.columns]
+            if any(p.ndim != 1 or p.shape != parts[0].shape for p in parts):
+                raise ValidationError(
+                    "the decoded values of the group's columns must be 1-D arrays of "
+                    "one length"
+                )
+            arr = np.stack(parts, axis=1)
+        else:
+            arr = _as_array("values", values)
+        if arr.dtype.kind not in "iuf" or arr.ndim != 2 or arr.shape[1] != k:
+            raise ValidationError(
+                f"values must be a real (n_trials, {k}) array or decode's mapping; got "
+                f"dtype {arr.dtype}, shape {arr.shape}"
+            )
+        out: FloatArray = arr.astype(np.float64)
+        return out
+
+
+def categorical_design(
+    values: ArrayLike,
+    levels: ArrayLike | None = None,
+    *,
+    name: str,
+    basis: Literal["polynomial", "helmert"] | ArrayLike = "polynomial",
+) -> CategoricalDesign:
+    r"""Code a categorical regressor as one regressor group, `docs/model.md` § 11.7.
+
+    With $L$ levels the coding has $L-1$ columns, the rows of a fixed basis $Q$
+    with orthonormal columns that sum to zero, $Q^\top Q=I$ and
+    $Q^\top\mathbf 1=0$; fitted as one group
+    (`MTDR(groups=design.groups)`), the levels' responses $B_a$ share one
+    neural basis and sum to zero, (M61). Zero is the equally weighted average
+    of the levels, not a reference level or the trial-weighted mean.
+
+    Parameters
+    ----------
+    values : array_like
+        `(n_trials,)` labels: numbers, strings or booleans, no missing values.
+    levels : array_like, optional
+        The levels in coding order, distinct, at least two; levels absent from
+        `values` are allowed. `None` takes the sorted distinct values.
+    name : str
+        The group's name (keyword-only); the columns are `name_1`, ...,
+        `name_{L-1}`.
+    basis : {"polynomial", "helmert"} or array_like
+        $Q$. `"polynomial"`: the orthonormal polynomials of the level indices
+        $0,\dots,L-1$, the $Q$ factor of the QR decomposition of the
+        Vandermonde matrix $[1,x,\dots,x^{L-1}]$ without its constant column,
+        each signed so that its leading coefficient is positive (computed by
+        the three-term recurrence, which is stable for any $L$; for five
+        levels these are the familiar linear, quadratic, cubic and quartic
+        columns divided by their norms). `"helmert"`: the normalised Helmert
+        basis, `scipy.linalg.helmert(L).T` (column $j$ compares level $j+1$
+        with the mean of the levels before it). An array: an $(L, L-1)$
+        finite basis, zero-sum to rounding and orthonormal to $10^{-10}$. Any
+        orthonormal zero-sum basis gives the same fitted model (§ 11.9); a
+        coding that is not orthonormal can still be fitted as plain columns
+        with `MTDR(groups=...)`, at the cost of the invariances of § 11.9.
+
+    Returns
+    -------
+    CategoricalDesign
+        The coding, its design `X` and its `groups`.
+
+    Raises
+    ------
+    ValidationError
+        For `values` that are not 1-D, missing, or outside `levels`; fewer
+        than two levels; levels that repeat, are missing or cannot be sorted
+        (pass `levels`).
+    ParameterError
+        For a bad `name` (empty, not a string, reserved, or column names that
+        are not valid regressor names) or `basis` (an array that is not
+        orthonormal and zero-sum: `scipy.linalg.orth` of a centred coding
+        gives one).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from mtdr import categorical_design
+    >>> design = categorical_design([3, 6, 12, 24, 48, 12], name="sa")
+    >>> design.columns, design.X.shape, design.counts.tolist()
+    (('sa_1', 'sa_2', 'sa_3', 'sa_4'), (6, 4), [1, 1, 2, 1, 1])
+    >>> bool(np.allclose(design.basis[:, 0] * np.sqrt(10), [-2, -1, 0, 1, 2]))
+    True
+    >>> design.groups
+    {'sa': ('sa_1', 'sa_2', 'sa_3', 'sa_4')}
+    """
+    given: object = name
+    if not isinstance(given, str) or not given:
+        raise ParameterError(f"name must be a non-empty string; got {name!r}")
+    if name in RESERVED_NAMES:
+        raise ParameterError(f"name {name!r} is reserved")
+    labels = _labels(values, "values")
+    if levels is None:
+        try:
+            level_arr = np.unique(labels)
+        except TypeError as err:
+            raise ValidationError(
+                f"the values cannot be sorted ({err}); pass levels in coding order"
+            ) from err
+    else:
+        level_arr = _labels(levels, "levels")
+        if len(set(level_arr.tolist())) != level_arr.size:
+            raise ValidationError(f"levels repeat a level: {level_arr.tolist()}")
+    L = int(level_arr.size)
+    if L < 2:
+        raise ValidationError(
+            "a categorical regressor needs at least two levels; got "
+            f"{level_arr.tolist()}"
+        )
+    columns = require_names([f"{name}_{j}" for j in range(1, L)], L - 1)
+    Q = _categorical_basis(basis, L)
+    index = _level_index(labels, level_arr, "values")
+    counts = np.bincount(index, minlength=L).astype(np.int64)
+    return CategoricalDesign(
+        name=name,
+        levels=np.array(level_arr),
+        counts=counts,
+        basis=Q,
+        columns=columns,
+        X=np.array(Q[index]),
+    )
+
+
+def _labels(values: object, what: str) -> NDArray[Any]:
+    """Return labels as a 1-D array without missing entries, else raise."""
+    arr = _as_array(what, values)
+    if arr.ndim != 1:
+        raise ValidationError(
+            f"{what} must be 1-D, one label per trial; got shape {arr.shape}"
+        )
+    if arr.dtype.kind not in "biufUSO":
+        raise ValidationError(
+            f"{what} must hold numbers, strings or booleans; got dtype {arr.dtype}"
+        )
+    if arr.dtype.kind in "fc":
+        missing = np.isnan(arr)
+    elif arr.dtype.kind == "O":
+        missing = np.array(
+            [v is None or (isinstance(v, float) and np.isnan(v)) for v in arr.tolist()],
+            dtype=bool,
+        )
+    else:
+        missing = np.zeros(arr.shape, dtype=bool)
+    if missing.any():
+        raise ValidationError(
+            f"{what} has missing labels (NaN or None) at "
+            f"{_listed(np.flatnonzero(missing))}"
+        )
+    return arr
+
+
+def _level_index(values: object, levels: NDArray[Any], what: str) -> IntArray:
+    """Return each value's level index; raise listing the labels outside `levels`."""
+    labels = _labels(values, what)
+    lookup = {level: k for k, level in enumerate(levels.tolist())}
+    index = [lookup.get(v, -1) for v in labels.tolist()]
+    outside = sorted(
+        {repr(v) for v, k in zip(labels.tolist(), index, strict=True) if k < 0}
+    )
+    if outside:
+        raise ValidationError(
+            f"{what} holds labels {_listed(outside)} that are not among the levels "
+            f"{levels.tolist()}"
+        )
+    out: IntArray = np.array(index, dtype=np.int64)
+    return out
+
+
+#: An explicit categorical basis must be orthonormal and zero-sum to this.
+_BASIS_TOLERANCE = 1e-10
+
+
+def _categorical_basis(basis: object, L: int) -> FloatArray:
+    """Return the `(L, L - 1)` basis `basis` names or gives, checked."""
+    if isinstance(basis, str):
+        if basis == "polynomial":
+            return _polynomial_basis(L)
+        if basis == "helmert":
+            out: FloatArray = np.ascontiguousarray(scipy.linalg.helmert(L).T)
+            return out
+        raise ParameterError(
+            f"basis must be 'polynomial', 'helmert' or an (L, L - 1) array; got "
+            f"{basis!r}"
+        )
+    try:
+        Q = np.array(basis, dtype=np.float64)
+    except (TypeError, ValueError) as err:
+        raise ParameterError(f"basis is not a real array: {err}") from err
+    if Q.shape != (L, L - 1) or not np.isfinite(Q).all():
+        raise ParameterError(
+            f"basis must be a finite (L, L - 1) = ({L}, {L - 1}) array; got shape "
+            f"{Q.shape}"
+        )
+    sums = float(np.abs(Q.sum(axis=0)).max())
+    gram = float(np.abs(Q.T @ Q - np.eye(L - 1)).max())
+    if sums > _BASIS_TOLERANCE * np.sqrt(L) or gram > _BASIS_TOLERANCE:
+        raise ParameterError(
+            "basis must have orthonormal columns that sum to zero (column sums up to "
+            f"{sums:.3g}, |Q'Q - I| up to {gram:.3g}); scipy.linalg.orth(C - "
+            "C.mean(axis=0)) gives such a basis for a coding C. A coding that is "
+            "not orthonormal can be fitted as plain columns with MTDR(groups=...)"
+        )
+    return Q
+
+
+def _polynomial_basis(L: int) -> FloatArray:
+    r"""Orthonormal polynomials of the indices $0,\dots,L-1$, constant dropped.
+
+    The three-term (Stieltjes) recurrence with a full re-orthogonalisation,
+    on the indices centred and scaled to $[-1, 1]$ (the same polynomials): the
+    $Q$ factor of the Vandermonde matrix's QR decomposition, signed so that
+    each leading coefficient is positive, without its ill-conditioning.
+    """
+    x = np.linspace(-1.0, 1.0, L)
+    Q = np.zeros((L, L))
+    Q[:, 0] = 1.0 / np.sqrt(L)
+    for j in range(1, L):
+        v = x * Q[:, j - 1]
+        for _ in range(2):  # re-orthogonalise against every earlier column
+            v -= Q[:, :j] @ (Q[:, :j].T @ v)
+        Q[:, j] = v / np.linalg.norm(v)
+    out: FloatArray = np.ascontiguousarray(Q[:, 1:])
+    return out
 
 
 # =========================================================================== helpers

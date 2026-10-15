@@ -37,6 +37,12 @@ def to_dataset(model: MTDR) -> xarray.Dataset:
     `noise_precision` `(neuron,)`. Attributes: `estimator`, `aic`,
     `log_likelihood`, `n_parameters`, `mtdr_version`.
 
+    With regressor groups (`docs/model.md` § 11) the latent quantities move to
+    a `group` dimension: `W` is `(group, neuron, component)` and `rank`
+    `(group,)`, while `S` and `B` keep `regressor`, and a `group_of`
+    coordinate on `regressor` holds each column's group. A model whose every
+    group is one column named after itself gives the ungrouped dataset.
+
     Parameters
     ----------
     model : MTDR
@@ -60,6 +66,10 @@ def to_dataset(model: MTDR) -> xarray.Dataset:
     >>> ds = to_dataset(MTDR(ranks=[2, 1], estimator="svd").fit(sim.Y, sim.X))
     >>> ds["rank"].values.tolist(), bool(ds["W"].isnull()[1, :, 1].all())
     ([2, 1], True)
+    >>> grouped = MTDR(ranks={"g": 2}, groups={"g": ["x0", "x1"]}, estimator="svd")
+    >>> ds = to_dataset(grouped.fit(sim.Y, sim.X))
+    >>> dict(ds["W"].sizes), ds["group_of"].values.tolist()
+    ({'group': 1, 'neuron': 10, 'component': 2}, ['g', 'g'])
     """
     try:
         import xarray as xr
@@ -70,32 +80,41 @@ def to_dataset(model: MTDR) -> xarray.Dataset:
             "xarray pandas)"
         ) from err
     names = list(model.regressor_names_)
-    ranks = [model.ranks_[name] for name in names]
+    groups = list(model.group_names_)
+    grouped = model._grouped()
+    owner = model._owner()
+    ranks = [model.ranks_[group] for group in groups]
+    column_ranks = [model.ranks_[owner[name]] for name in names]
     n, T, P = model.n_neurons_, model.n_bins_, len(names)
     width = max(ranks)
-    W = np.full((P, n, width), np.nan)
+    W = np.full((len(groups), n, width), np.nan)
     S = np.full((P, T, width), np.nan)
+    for g, group in enumerate(groups):
+        W[g, :, : ranks[g]] = model.W_[group]
     for p, name in enumerate(names):
-        r = ranks[p]
-        W[p, :, :r] = model.W_[name]
-        S[p, :, :r] = model.S_[name]
+        S[p, :, : column_ranks[p]] = model.S_[name]
+    latent = "group" if grouped else "regressor"
     data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {
         "B": (("regressor", "neuron", "time"), np.stack([model.B_[m] for m in names])),
-        "W": (("regressor", "neuron", "component"), W),
+        "W": ((latent, "neuron", "component"), W),
         "S": (("regressor", "time", "component"), S),
-        "rank": (("regressor",), np.array(ranks, dtype=np.int64)),
+        "rank": ((latent,), np.array(ranks, dtype=np.int64)),
     }
     if model.intercept_ is not None:
         data_vars["intercept"] = (("neuron", "time"), np.array(model.intercept_))
     data_vars["noise_precision"] = (("neuron",), np.array(model.noise_precision_))
+    coords: dict[str, object] = {
+        "regressor": names,
+        "neuron": np.arange(n),
+        "time": np.arange(T),
+        "component": np.arange(width),
+    }
+    if grouped:
+        coords["group"] = groups
+        coords["group_of"] = ("regressor", [owner[name] for name in names])
     return xr.Dataset(
         data_vars,
-        coords={
-            "regressor": names,
-            "neuron": np.arange(n),
-            "time": np.arange(T),
-            "component": np.arange(width),
-        },
+        coords=coords,
         attrs={
             "estimator": model.estimator_,
             "aic": model.aic_,

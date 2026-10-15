@@ -72,6 +72,41 @@ The full rank is `min(n_neurons, n_bins)`, not `n_bins`: a rank above it is a
 a mask each neuron's fit uses only its observed trials; with `ridge > 0` it is ridge
 regression.
 
+## Regressor groups
+
+`MTDR(groups={"sa": ["sa_1", "sa_2", "sa_3", "sa_4"]})` makes the listed columns share
+one neural basis and one rank; columns not listed are groups of their own, named after
+themselves ([model §11](../model.md#11-regressor-groups); a worked example is in
+[Getting started](../getting-started.md#a-categorical-stimulus-with-one-shared-subspace)).
+[`resolve_groups`][mtdr.data.resolve_groups] returns the groups `fit` will use, in their
+order (by smallest member column). With `groups`, `ranks` and `rank_search_init` are
+`"aic"` (or a string) or mappings naming every group; a sequence is refused, and so is a
+key that is a column of a group of several columns.
+
+Everything that belongs to a latent weight is keyed by **group**; everything that belongs
+to a design column by **column**:
+
+| Keyed by group | Keyed by column |
+|---|---|
+| `groups_`, `group_names_`, `ranks_`, `W_`, the blocks of `weight_posterior_cov_`, `rank_search_history_` names | `regressor_names_`, `S_`, `B_` |
+| `project(Y, name)` and its `basis=`, `orthogonalize(order)`, `subspace_angles(a, b)`, `explained_variance` keys | `decode` values and `known=`, `predict`, `log_likelihood` |
+| `plot.weights`, `plot.trajectories`, `plot.rank_search`, `plot.recovery` | `plot.bases`, `plot.coefficient_norms` |
+
+A column of a group of several columns passed where a group is expected raises a
+`ParameterError` that names its group. `decode(levels={"sa": rows})` takes candidate rows
+of one value per column of the group (`CategoricalDesign.rows()`), enumerated as one
+discrete unit for the cap of 64 combinations and for `return_llr`; a column of such a
+group cannot have levels of its own. `to_xarray()` puts `W` and `rank` on a `group`
+dimension and records each column's group in a `group_of` coordinate. With every column
+alone (`groups=None`, or explicit single-column groups named after their columns) the
+fit, the attributes and every output are those without groups, bit for bit.
+
+Each group's rank is at most `min(n_neurons, |g| n_bins, max_rank)`, so a group's rank
+can exceed `n_bins`; `max_rank` itself may not exceed the largest group's
+`min(n_neurons, |g| n_bins)`. `total_rank_` counts a shared basis once, but the parameter
+counts (`n_parameters_`, model (M59)-(M60)) grow with `|g|`: compare groupings by
+held-out likelihood.
+
 ## Reference
 
 ::: mtdr.model
