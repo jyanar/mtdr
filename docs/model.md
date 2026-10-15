@@ -325,7 +325,10 @@ $$
 
 A step must lower AIC by more than $\delta$ (default 0). Ranks never decrease, so the
 start matters: by default, MMLE starts at ranks selected by precision-weighted SVD
-(M18w), searching from all ones.
+(M18w), searching from all ones. That start can overshoot a rank (seen for a regressor
+group, §11.6): the SVD stage picks a rank above the one whose MMLE score is lower, and
+the upward-only search cannot come back down. When the rank matters, compare with
+`rank_search_init="ones"` or with held-out likelihoods across ranks.
 [`RankSearchHistory`][mtdr.rank_search.RankSearchHistory] records the initial and
 accepted fits and every round's candidate scores, including a rejected final round.
 
@@ -650,12 +653,13 @@ This is the derivation of [`update_intercept`][mtdr.mmle.update_intercept] with
 $\Phi_i=\tilde\Phi_iM$: writing $x_k=\bar x_i+(x_k-\bar x_i)$ splits $\Phi_i$ into a
 centred part and $\mathbf 1\otimes\tilde\Psi_iM$, $\tilde\Psi_i=[\bar x_{ip(c)}\tilde
 S[:,c]]_c$, and Woodbury gives (M57). The refinement runs L-BFGS-B over $\tilde S$ (all
-$T\times r_{\rm exp}$ entries) with the gradient (M55). The soft directions of a grouped
-objective are $S_p\to S_pM_g$ with one $M_g$ for all of a group's columns, so
-`basis_preconditioning` stretches each group's stacked bases $[S_p]_{p\in g}$ inside
-their own span rather than each column's (stretching each column's span also stiffens
-the directions $S_pM_p$ with different $M_p$; measured, it doubled the evaluations): a
-change of variables that leaves the optimum unchanged.
+$T\times r_{\rm exp}$ entries) with the gradient (M55). A grouped objective's soft
+directions are $S_p\to S_pM_g$, one $M_g$ for all of a group's columns, so
+`basis_preconditioning` stretches each group's stacked bases $\tilde S_g=[S_p]_{p\in g}$
+inside their own span, $D_g=I+(\alpha-1)\Pi_g$ with $\Pi_g$ the projector onto that span,
+rather than each column's span (which also stiffens the directions $S_pM_p$ with different
+$M_p$; measured, it doubled the evaluations): a change of variables that leaves the
+optimum unchanged.
 
 ### 11.5 The least-squares start
 
@@ -703,7 +707,8 @@ with $K_{mml}$ and reports $K^{\rm id}_{mml}$ in `n_parameters_`, so the selecti
 exceeds `aic_` by $\sum_gr_g(r_g-1)$. Equal numerical rank across groupings is not an
 equal parameter count. Each group's rank is capped at
 $\min(n,\lvert g\rvert T,\texttt{max\_rank})$ (`max_rank=None`: the first two), and the
-greedy search (M39) raises each group up to its own cap.
+greedy search (M39) raises each group up to its own cap. The default weighted-SVD start
+can overshoot a group's rank, which the upward-only search keeps (§7.2).
 
 ### 11.7 Categorical regressors
 
@@ -720,10 +725,11 @@ the equally weighted average of the levels, neither a reference level nor the
 trial-weighted mean. Within the shared subspace each level has its own trajectory: the
 model imposes no ordering of the levels and no boundary between them, and rank 1 can still
 represent $L$ distinct values. [`categorical_design`][mtdr.data.categorical_design] builds
-the coding (orthonormal polynomials of the level indices, the normalised Helmert basis, or
-a given orthonormal zero-sum basis), its `groups` for `MTDR`, its `level_responses` (M61),
-and the candidate `rows()` for decoding the level, $Q$ itself. A level absent from every
-fitted trial makes $[\mathbf 1\ X]$ rank-deficient, which `fit` rejects.
+the coding (orthonormal polynomials of the level indices, or a given orthonormal zero-sum
+basis), its `groups` for `MTDR`, its `level_responses` (M61), defined for a grouped or a
+separate-term fit alike, and the candidate `rows()` for decoding the level, $Q$ itself. A
+level absent from every fitted trial makes $[\mathbf 1\ X]$ rank-deficient, which `fit`
+rejects.
 
 ### 11.8 The canonical frame
 
@@ -747,12 +753,14 @@ Likelihoods and AIC are computed in the raw frame.
   $\phi_{kg}(t)=\sum_{p\in g}x_{kp}\,s_p(t)$. Recoding $X_g\to X_gR$ with the bases mixed
   by $R^{-1}$, $S'_q=\sum_p(R^{-1})_{qp}S_p$, leaves it unchanged for **any** invertible
   $R$ at `basis_ridge=0`.
-- The least-squares start (M58), the `ridge` and the canonical frame are invariant only
-  under **orthogonal** $R$: $[\hat B_p]_p$ is then right-multiplied by the orthogonal
-  $R\otimes I_T$. The preconditioning of `basis_preconditioning=True` is not invariant
-  under any mixing within a group; it changes only the optimiser's path. So for
-  orthonormal codings converged fits agree to optimiser tolerance; other codings,
-  including a rescaled one, reach the same optimum when it is unique, but by another path.
+- The least-squares start (M58), the `ridge`, the canonical frame and the preconditioner
+  of `basis_preconditioning=True` are invariant (equivariant) only under **orthogonal**
+  $R$: $[\hat B_p]_p$ is then right-multiplied by the orthogonal $R\otimes I_T$, and the
+  stacked bases map by $A=R^\top\otimes I_T$, so $\Pi_g\to A\Pi_gA^\top$ and
+  $D_g(A\Delta)=AD_g(\Delta)$. A non-orthogonal $R$ changes the preconditioner's metric
+  and hence the optimiser's path. So for orthonormal codings converged fits agree to
+  optimiser tolerance (stopping tests and rounding aside); other codings, including a
+  rescaled one, reach the same optimum when it is unique, but by another path.
 - A permutation $P$ of the levels of an orthonormal zero-sum $Q$ is the orthogonal recoding
   $R=Q^\top PQ$.
 - The prior $w_{ig}\sim\mathcal N(0,I_{r_g})$ leaves the likelihood invariant to
