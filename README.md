@@ -64,8 +64,8 @@ as good as MATLAB's.
 Where the port deliberately departs from the MATLAB code (some defaults, a few fixed
 bugs, SciPy's optimizers in place of `minFunc`), each difference and, where available,
 a compatibility option is listed in
-[`docs/differences-from-matlab.md`](https://github.com/jyanar/mtdr/blob/main/docs/differences-from-matlab.md). The model and
-its estimation are described in [`docs/model.md`](https://github.com/jyanar/mtdr/blob/main/docs/model.md),
+[`docs/differences-from-matlab.md`](https://jyanar.github.io/mtdr/differences-from-matlab/). The model and
+its estimation are described in [`docs/model.md`](https://jyanar.github.io/mtdr/model/),
 with technical appendices for the equations cited by the code.
 
 ## Development
